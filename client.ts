@@ -1,5 +1,6 @@
 import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createSocket } from "node:dgram";
+import { join } from "node:path";
 
 type StreamConfig = {
   id: string;
@@ -55,7 +56,8 @@ type RuntimeConfig = {
 const configuredServerUrl = Bun.env.SERVER_URL;
 const clientId = Bun.env.CLIENT_ID || Bun.env.COMPUTERNAME || `client-${crypto.randomUUID().slice(0, 8)}`;
 const clientName = Bun.env.CLIENT_NAME || clientId;
-const ffplayPath = "./ffplay.exe";
+const clientDir = import.meta.dir;
+const ffplayPath = join(clientDir, "ffplay.exe");
 const persistedConfigPath = "./last-config.json";
 const lockFilePath = "./client.lock";
 const mdnsAddress = Bun.env.MDNS_MULTICAST_ADDRESS || "224.0.0.251";
@@ -678,9 +680,18 @@ function applyConfig(config: RuntimeConfig) {
 
 async function connect() {
   const discovered = await discoverServerUrl();
-  const targetServerUrl = discovered || configuredServerUrl || "ws://localhost:3500/ws";
+  const targetServerUrl = configuredServerUrl || discovered || lastDiscoveredServerUrl;
   if (discovered) {
     lastDiscoveredServerUrl = discovered;
+  }
+
+  if (!targetServerUrl) {
+    appendLog(`No server discovered via mDNS; retrying in ${reconnectDelayMs}ms`);
+    setTimeout(() => {
+      connect().catch((error) => appendLog(`Reconnect failed: ${String(error)}`));
+    }, reconnectDelayMs);
+    reconnectDelayMs = Math.min(reconnectDelayMs * 2, 15000);
+    return;
   }
 
   appendLog(`Connecting to ${targetServerUrl}`);
