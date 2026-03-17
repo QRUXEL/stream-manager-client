@@ -1,0 +1,11 @@
+{
+  "name": "ffplay-client",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "bun-types": "latest"
+  },
+  "scripts": {
+    "client": "bun run client.ts"
+  }
+}
