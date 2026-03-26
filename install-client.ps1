@@ -1,7 +1,7 @@
 param(
   [string]$RepoUrl,
   [string]$Branch = 'main',
-  [string]$InstallRoot = (Join-Path $env:USERPROFILE 'stream-manager-client'),
+  [string]$InstallRoot,
   [switch]$ForceFresh
 )
 
@@ -9,6 +9,21 @@ $ErrorActionPreference = 'Stop'
 
 function Write-Info([string]$Message) {
   Write-Host "[stream-manager-bootstrap] $Message"
+}
+
+function Resolve-DefaultInstallRoot {
+  $base = ''
+  if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+    $base = $env:USERPROFILE
+  }
+  elseif (-not [string]::IsNullOrWhiteSpace($env:HOMEDRIVE) -and -not [string]::IsNullOrWhiteSpace($env:HOMEPATH)) {
+    $base = "$($env:HOMEDRIVE)$($env:HOMEPATH)"
+  }
+  else {
+    $base = 'C:\Users\Public'
+  }
+
+  return Join-Path $base 'stream-manager-client'
 }
 
 function Refresh-ProcessPath {
@@ -114,11 +129,12 @@ function Resolve-RepoUrl([string]$ExplicitRepoUrl) {
     return $env:STREAM_MANAGER_REPO_URL
   }
 
-  $candidates = @(
-    (Join-Path $PSScriptRoot 'client'),
-    $PSScriptRoot,
-    (Get-Location).Path
-  )
+  $candidates = @()
+  if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+    $candidates += (Join-Path $PSScriptRoot 'client')
+    $candidates += $PSScriptRoot
+  }
+  $candidates += (Get-Location).Path
 
   foreach ($candidate in $candidates) {
     $origin = Try-GetOriginFromPath -PathToCheck $candidate
@@ -150,6 +166,10 @@ Ensure-GitInstalled
 $RepoUrl = Resolve-RepoUrl -ExplicitRepoUrl $RepoUrl
 if ([string]::IsNullOrWhiteSpace($RepoUrl)) {
   throw 'RepoUrl is required. Pass -RepoUrl, set STREAM_MANAGER_REPO_URL, or run from an existing client git checkout.'
+}
+
+if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
+  $InstallRoot = Resolve-DefaultInstallRoot
 }
 
 Ensure-Repo -TargetPath $InstallRoot -TargetRepoUrl $RepoUrl -TargetBranch $Branch -Recreate:$ForceFresh
