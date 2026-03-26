@@ -66,7 +66,6 @@ const clientName = Bun.env.CLIENT_NAME || clientId;
 const clientDir = import.meta.dir;
 const ffplayPath = join(clientDir, "ffplay.exe");
 const persistedConfigPath = "./last-config.json";
-const overlayStatePath = "./overlay-state.json";
 const lockFilePath = "./client.lock";
 const overlayAppDir = join(clientDir, "electron-overlay");
 const overlayRestartDelayMs = 2000;
@@ -83,6 +82,7 @@ let overlayRestartTimer: ReturnType<typeof setTimeout> | null = null;
 let lastRestartAt: string | null = null;
 let currentCommandLine: string | null = null;
 let lastDiscoveredServerUrl: string | null = null;
+let overlayServerBaseUrl: string | null = null;
 const logs: string[] = [];
 const textDecoder = new TextDecoder();
 let lockFd: number | null = null;
@@ -173,26 +173,13 @@ function findElectronExecutable() {
   return null;
 }
 
-function buildOverlayStatePayload(stream: StreamConfig | null) {
-  const playerName = String(stream?.playerName || stream?.name || "").trim();
-  const text = playerName ? `Currently watching ${playerName} P.O.V` : "";
-
-  return {
-    updatedAt: new Date().toISOString(),
-    streamId: stream?.id || null,
-    playerName,
-    team: stream?.team || "",
-    platform: stream?.platform || "",
-    text,
-  };
-}
-
-function writeOverlayStateForStream(stream: StreamConfig | null) {
-  const payload = buildOverlayStatePayload(stream);
+function buildOverlayServerBaseUrl(wsUrl: string) {
   try {
-    writeFileSync(overlayStatePath, JSON.stringify(payload, null, 2), "utf-8");
-  } catch (error) {
-    appendLog(`Failed to write overlay state: ${String(error)}`);
+    const parsed = new URL(wsUrl);
+    const protocol = parsed.protocol === "wss:" ? "https:" : "http:";
+    return `${protocol}//${parsed.host}`;
+  } catch {
+    return null;
   }
 }
 
@@ -213,11 +200,27 @@ function stopOverlayApp() {
   }
 
   overlayProcess = null;
+  overlayServerBaseUrl = null;
 }
 
-function startOverlayApp() {
-  if (overlayProcess || shuttingDown) {
+function startOverlayApp(serverBaseUrl: string) {
+  if (shuttingDown) {
     return;
+  }
+
+  const normalizedBaseUrl = String(serverBaseUrl || "").trim();
+  if (!normalizedBaseUrl) {
+    appendLog("Overlay URL is empty; skipping overlay start");
+    return;
+  }
+
+  if (overlayProcess) {
+    if (overlayServerBaseUrl === normalizedBaseUrl) {
+      return;
+    }
+
+    appendLog(`Overlay target changed to ${normalizedBaseUrl}; restarting overlay app`);
+    stopOverlayApp();
   }
 
   const electronPath = findElectronExecutable();
@@ -233,11 +236,11 @@ function startOverlayApp() {
     return;
   }
 
-  const stateFileFullPath = join(clientDir, "overlay-state.json");
+  const overlayUrl = `${normalizedBaseUrl}/overlay?clientId=${encodeURIComponent(clientId)}`;
   const overlayArgs = [
     overlayAppDir,
-    "--overlay-state",
-    stateFileFullPath,
+    "--overlay-url",
+    overlayUrl,
     "--client-id",
     clientId,
   ];
@@ -257,6 +260,7 @@ function startOverlayApp() {
   });
 
   overlayProcess = processRef;
+  overlayServerBaseUrl = normalizedBaseUrl;
   pipeStreamToLogs(processRef.stdout, "overlay-out").catch((error) => appendLog(`overlay stdout pipe error: ${String(error)}`));
   pipeStreamToLogs(processRef.stderr, "overlay-err").catch((error) => appendLog(`overlay stderr pipe error: ${String(error)}`));
 
@@ -272,7 +276,9 @@ function startOverlayApp() {
 
     overlayRestartTimer = setTimeout(() => {
       overlayRestartTimer = null;
-      startOverlayApp();
+      if (overlayServerBaseUrl) {
+        startOverlayApp(overlayServerBaseUrl);
+      }
     }, overlayRestartDelayMs);
   });
 }
@@ -489,10 +495,6 @@ function saveLastConfig(config: RuntimeConfig) {
   } catch (error) {
     appendLog(`Failed to persist last config: ${String(error)}`);
   }
-}
-
-function writeOverlayState(config: RuntimeConfig) {
-  writeOverlayStateForStream(config.stream);
 }
 
 function loadLastConfig(): RuntimeConfig | null {
@@ -826,7 +828,6 @@ function applyConfig(config: RuntimeConfig) {
 
   desiredConfig = normalized;
   saveLastConfig(normalized);
-  writeOverlayState(normalized);
   startFfplay(normalized).catch((error) => appendLog(`Failed to start ffplay: ${String(error)}`));
   publishHealth();
 }
@@ -848,6 +849,13 @@ async function connect() {
   }
 
   appendLog(`Connecting to ${targetServerUrl}`);
+  const overlayBase = buildOverlayServerBaseUrl(targetServerUrl);
+  if (overlayBase) {
+    startOverlayApp(overlayBase);
+  } else {
+    appendLog(`Could not derive overlay HTTP URL from ${targetServerUrl}`);
+  }
+
   ws = new WebSocket(targetServerUrl);
 
   ws.addEventListener("open", () => {
@@ -910,8 +918,6 @@ if (!acquireSingleInstanceLock()) {
 }
 
 registerShutdownHandlers();
-writeOverlayStateForStream(null);
-startOverlayApp();
 
 const fallbackConfig = loadLastConfig();
 if (fallbackConfig) {
