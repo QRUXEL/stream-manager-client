@@ -3,9 +3,11 @@
   "private": true,
   "type": "module",
   "devDependencies": {
-    "bun-types": "latest"
+    "bun-types": "latest",
+    "electron": "^35.2.0"
   },
   "scripts": {
-    "client": "bun run client.ts"
+    "client": "bun run client.ts",
+    "overlay": "electron electron-overlay"
   }
 }

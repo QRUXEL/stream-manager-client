@@ -7,6 +7,13 @@ type StreamConfig = {
   name: string;
   url: string;
   extraArgs: string;
+  team?: string;
+  shortName?: string;
+  playerName?: string;
+  platform?: string;
+  sourceSheetId?: string;
+  sourceUrl?: string;
+  playbackUrl?: string;
 };
 
 type ToggleValue<T> = {
@@ -59,7 +66,10 @@ const clientName = Bun.env.CLIENT_NAME || clientId;
 const clientDir = import.meta.dir;
 const ffplayPath = join(clientDir, "ffplay.exe");
 const persistedConfigPath = "./last-config.json";
+const overlayStatePath = "./overlay-state.json";
 const lockFilePath = "./client.lock";
+const overlayAppDir = join(clientDir, "electron-overlay");
+const overlayRestartDelayMs = 2000;
 const mdnsAddress = Bun.env.MDNS_MULTICAST_ADDRESS || "224.0.0.251";
 const mdnsPort = Number(Bun.env.MDNS_PORT || "5353");
 const discoveryTopic = "ffplay-admin-bun-v1";
@@ -69,12 +79,15 @@ let reconnectDelayMs = 1000;
 let activeProcess: ReturnType<typeof Bun.spawn> | null = null;
 let desiredConfig: RuntimeConfig | null = null;
 let restartTimer: ReturnType<typeof setTimeout> | null = null;
+let overlayRestartTimer: ReturnType<typeof setTimeout> | null = null;
 let lastRestartAt: string | null = null;
 let currentCommandLine: string | null = null;
 let lastDiscoveredServerUrl: string | null = null;
 const logs: string[] = [];
 const textDecoder = new TextDecoder();
 let lockFd: number | null = null;
+let overlayProcess: ReturnType<typeof Bun.spawn> | null = null;
+let shuttingDown = false;
 
 function appendLog(line: string) {
   const clean = line.trim();
@@ -142,6 +155,128 @@ function releaseSingleInstanceLock() {
   }
 }
 
+function findElectronExecutable() {
+  const configured = String(Bun.env.ELECTRON_PATH || "").trim();
+  const candidates = [
+    configured,
+    join(clientDir, "node_modules", ".bin", "electron.cmd"),
+    join(clientDir, "node_modules", ".bin", "electron.exe"),
+    join(clientDir, "node_modules", ".bin", "electron"),
+  ].filter((item) => item.length > 0);
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function buildOverlayStatePayload(stream: StreamConfig | null) {
+  const playerName = String(stream?.playerName || stream?.name || "").trim();
+  const text = playerName ? `Currently watching ${playerName} P.O.V` : "";
+
+  return {
+    updatedAt: new Date().toISOString(),
+    streamId: stream?.id || null,
+    playerName,
+    team: stream?.team || "",
+    platform: stream?.platform || "",
+    text,
+  };
+}
+
+function writeOverlayStateForStream(stream: StreamConfig | null) {
+  const payload = buildOverlayStatePayload(stream);
+  try {
+    writeFileSync(overlayStatePath, JSON.stringify(payload, null, 2), "utf-8");
+  } catch (error) {
+    appendLog(`Failed to write overlay state: ${String(error)}`);
+  }
+}
+
+function stopOverlayApp() {
+  if (overlayRestartTimer) {
+    clearTimeout(overlayRestartTimer);
+    overlayRestartTimer = null;
+  }
+
+  if (!overlayProcess) {
+    return;
+  }
+
+  try {
+    overlayProcess.kill();
+  } catch (error) {
+    appendLog(`Error while stopping overlay app: ${String(error)}`);
+  }
+
+  overlayProcess = null;
+}
+
+function startOverlayApp() {
+  if (overlayProcess || shuttingDown) {
+    return;
+  }
+
+  const electronPath = findElectronExecutable();
+  if (!electronPath) {
+    appendLog("Electron executable not found. Overlay app is disabled.");
+    return;
+  }
+
+  const mainScriptPath = join(overlayAppDir, "main.cjs");
+  const packageJsonPath = join(overlayAppDir, "package.json");
+  if (!existsSync(mainScriptPath) || !existsSync(packageJsonPath)) {
+    appendLog(`Overlay app not found at ${overlayAppDir}`);
+    return;
+  }
+
+  const stateFileFullPath = join(clientDir, "overlay-state.json");
+  const overlayArgs = [
+    overlayAppDir,
+    "--overlay-state",
+    stateFileFullPath,
+    "--client-id",
+    clientId,
+  ];
+
+  const command = electronPath.toLowerCase().endsWith(".cmd")
+    ? ["cmd.exe", "/c", electronPath, ...overlayArgs]
+    : [electronPath, ...overlayArgs];
+
+  appendLog(`Starting overlay app: ${command.join(" ")}`);
+  const processRef = Bun.spawn(command, {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    onExit(_, exitCode, signalCode, error) {
+      appendLog(`Overlay app exited (code=${exitCode}, signal=${signalCode}, error=${String(error || "none")})`);
+    },
+  });
+
+  overlayProcess = processRef;
+  pipeStreamToLogs(processRef.stdout, "overlay-out").catch((error) => appendLog(`overlay stdout pipe error: ${String(error)}`));
+  pipeStreamToLogs(processRef.stderr, "overlay-err").catch((error) => appendLog(`overlay stderr pipe error: ${String(error)}`));
+
+  processRef.exited.then(() => {
+    if (overlayProcess !== processRef) {
+      return;
+    }
+
+    overlayProcess = null;
+    if (shuttingDown) {
+      return;
+    }
+
+    overlayRestartTimer = setTimeout(() => {
+      overlayRestartTimer = null;
+      startOverlayApp();
+    }, overlayRestartDelayMs);
+  });
+}
+
 function acquireSingleInstanceLock(): boolean {
   try {
     lockFd = openSync(lockFilePath, "wx");
@@ -180,15 +315,21 @@ function acquireSingleInstanceLock(): boolean {
 
 function registerShutdownHandlers() {
   process.on("exit", () => {
+    shuttingDown = true;
+    stopOverlayApp();
     releaseSingleInstanceLock();
   });
 
   process.on("SIGINT", () => {
+    shuttingDown = true;
+    stopOverlayApp();
     releaseSingleInstanceLock();
     process.exit(0);
   });
 
   process.on("SIGTERM", () => {
+    shuttingDown = true;
+    stopOverlayApp();
     releaseSingleInstanceLock();
     process.exit(0);
   });
@@ -211,6 +352,13 @@ function normalizeRuntimeConfig(raw: unknown): RuntimeConfig | null {
           name: String(streamRaw.name ?? "Unnamed stream"),
           url: String(streamRaw.url ?? ""),
           extraArgs: String(streamRaw.extraArgs ?? ""),
+          team: String(streamRaw.team ?? ""),
+          shortName: String(streamRaw.shortName ?? ""),
+          playerName: String(streamRaw.playerName ?? ""),
+          platform: String(streamRaw.platform ?? ""),
+          sourceSheetId: String(streamRaw.sourceSheetId ?? ""),
+          sourceUrl: String(streamRaw.sourceUrl ?? ""),
+          playbackUrl: String(streamRaw.playbackUrl ?? ""),
         }
       : null;
 
@@ -341,6 +489,10 @@ function saveLastConfig(config: RuntimeConfig) {
   } catch (error) {
     appendLog(`Failed to persist last config: ${String(error)}`);
   }
+}
+
+function writeOverlayState(config: RuntimeConfig) {
+  writeOverlayStateForStream(config.stream);
 }
 
 function loadLastConfig(): RuntimeConfig | null {
@@ -674,6 +826,7 @@ function applyConfig(config: RuntimeConfig) {
 
   desiredConfig = normalized;
   saveLastConfig(normalized);
+  writeOverlayState(normalized);
   startFfplay(normalized).catch((error) => appendLog(`Failed to start ffplay: ${String(error)}`));
   publishHealth();
 }
@@ -757,6 +910,8 @@ if (!acquireSingleInstanceLock()) {
 }
 
 registerShutdownHandlers();
+writeOverlayStateForStream(null);
+startOverlayApp();
 
 const fallbackConfig = loadLastConfig();
 if (fallbackConfig) {
