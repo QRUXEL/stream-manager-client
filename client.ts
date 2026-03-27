@@ -919,7 +919,7 @@ async function startFfplay(config: RuntimeConfig) {
       restartTimer = setTimeout(() => {
         restartTimer = null;
         if (desiredConfig) {
-          startFfplay(desiredConfig);
+          startFfplay(desiredConfig).catch((error) => appendLog(`Failed to restart ffplay: ${String(error)}`));
         }
       }, 1000);
     }
