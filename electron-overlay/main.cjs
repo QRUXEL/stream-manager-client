@@ -46,14 +46,16 @@ function createWindow() {
     height: 220,
     x: 20,
     y: 20,
+    show: true,
     transparent: true,
     frame: false,
     resizable: true,
     alwaysOnTop: true,
-    skipTaskbar: true,
-    focusable: false,
+    skipTaskbar: false,
+    focusable: true,
     hasShadow: false,
     backgroundColor: "#00000000",
+    title: `Stream Overlay - ${clientId}`,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -62,8 +64,9 @@ function createWindow() {
   });
 
   overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-  overlayWindow.setIgnoreMouseEvents(true, { forward: true });
+  overlayWindow.setIgnoreMouseEvents(false);
   overlayWindow.setAlwaysOnTop(true, "screen-saver");
+  overlayWindow.moveTop();
 
   const fallbackFile = path.join(__dirname, "overlay.html");
   const resolvedOverlayUrl =
