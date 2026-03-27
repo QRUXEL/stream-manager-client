@@ -107,7 +107,6 @@ function createWindow() {
   overlayWindow.setAlwaysOnTop(true, "screen-saver");
   overlayWindow.moveTop();
 
-  const fallbackFile = path.join(__dirname, "overlay.html");
   const resolvedOverlayUrl =
     overlayUrlArg && /^https?:\/\//i.test(overlayUrlArg)
       ? overlayUrlArg
@@ -115,9 +114,6 @@ function createWindow() {
 
   overlayWindow.loadURL(resolvedOverlayUrl).catch((error) => {
     console.error(`[overlay] Failed to load remote overlay URL (${resolvedOverlayUrl}):`, error);
-    overlayWindow.loadFile(fallbackFile).catch((fallbackError) => {
-      console.error("[overlay] Failed to load fallback overlay file:", fallbackError);
-    });
   });
 
   overlayWindow.on("closed", () => {
