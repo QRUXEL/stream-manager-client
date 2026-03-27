@@ -29,6 +29,58 @@ function Ensure-GitInstalled {
   }
 }
 
+function Get-FfplayCommand {
+  $ffplay = Get-Command ffplay.exe -ErrorAction SilentlyContinue
+  if ($ffplay) {
+    return $ffplay
+  }
+
+  return (Get-Command ffplay -ErrorAction SilentlyContinue)
+}
+
+function Ensure-FfplayInstalled {
+  $localFfplayPath = Join-Path $PSScriptRoot 'ffplay.exe'
+  if (Test-Path -Path $localFfplayPath) {
+    return
+  }
+
+  $ffplayCommand = Get-FfplayCommand
+  if (-not $ffplayCommand) {
+    Write-Host 'ffplay not found. Installing FFmpeg with winget...'
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+      throw 'winget is not available; cannot auto-install FFmpeg.'
+    }
+
+    winget install --id Gyan.FFmpeg -e --source winget --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -ne 0) {
+      Write-Host 'Primary FFmpeg package install failed. Trying fallback package ID...'
+      winget install --id FFmpeg.FFmpeg -e --source winget --accept-package-agreements --accept-source-agreements
+      if ($LASTEXITCODE -ne 0) {
+        throw 'FFmpeg installation via winget failed.'
+      }
+    }
+
+    Refresh-ProcessPath
+    $ffplayCommand = Get-FfplayCommand
+  }
+
+  if (-not $ffplayCommand) {
+    throw 'ffplay was not found after FFmpeg installation.'
+  }
+
+  $ffplaySource = $ffplayCommand.Source
+  if ([string]::IsNullOrWhiteSpace($ffplaySource) -and $ffplayCommand.PSObject.Properties['Path']) {
+    $ffplaySource = $ffplayCommand.Path
+  }
+
+  if ([string]::IsNullOrWhiteSpace($ffplaySource) -or -not (Test-Path -Path $ffplaySource)) {
+    throw 'Unable to resolve ffplay executable path after installation.'
+  }
+
+  Write-Host "Copying ffplay.exe from $ffplaySource to client folder..."
+  Copy-Item -Path $ffplaySource -Destination $localFfplayPath -Force
+}
+
 function Update-ClientFromGitHub {
   $repoRoot = (& git rev-parse --show-toplevel 2>$null)
   if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) {
@@ -107,11 +159,7 @@ function Update-ClientFromGitHub {
 
 Ensure-GitInstalled
 Update-ClientFromGitHub
-
-if (-not (Test-Path -Path .\ffplay.exe)) {
-  Write-Host 'Copying ffplay.exe from c:\tools\ffplay.exe to client folder...'
-  Copy-Item -Path 'c:\tools\ffplay.exe' -Destination (Join-Path $PSScriptRoot 'ffplay.exe') -Force
-}
+Ensure-FfplayInstalled
 
 if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
   Write-Host 'Installing Bun...'

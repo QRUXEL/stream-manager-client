@@ -1,5 +1,5 @@
 param(
-  [string]$RepoUrl,
+  [string]$RepoUrl = 'https://github.com/QRUXEL/stream-manager-client.git',
   [string]$Branch = 'main',
   [string]$InstallRoot,
   [switch]$ForceFresh
@@ -144,7 +144,7 @@ function Resolve-RepoUrl([string]$ExplicitRepoUrl) {
     }
   }
 
-  return $null
+  return 'https://github.com/QRUXEL/stream-manager-client.git'
 }
 
 function Resolve-SetupScriptPath([string]$RootPath) {
@@ -164,9 +164,6 @@ function Resolve-SetupScriptPath([string]$RootPath) {
 
 Ensure-GitInstalled
 $RepoUrl = Resolve-RepoUrl -ExplicitRepoUrl $RepoUrl
-if ([string]::IsNullOrWhiteSpace($RepoUrl)) {
-  throw 'RepoUrl is required. Pass -RepoUrl, set STREAM_MANAGER_REPO_URL, or run from an existing client git checkout.'
-}
 
 if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
   $InstallRoot = Resolve-DefaultInstallRoot
