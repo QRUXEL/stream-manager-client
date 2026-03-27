@@ -69,6 +69,8 @@ const persistedConfigPath = "./last-config.json";
 const lockFilePath = "./client.lock";
 const overlayAppDir = join(clientDir, "electron-overlay");
 const overlayRestartDelayMs = 2000;
+const overlayMinHealthyRunMs = 5000;
+const overlayMaxConsecutiveCrashes = 5;
 const mdnsAddress = Bun.env.MDNS_MULTICAST_ADDRESS || "224.0.0.251";
 const mdnsPort = Number(Bun.env.MDNS_PORT || "5353");
 const discoveryTopic = "ffplay-admin-bun-v1";
@@ -87,6 +89,11 @@ const logs: string[] = [];
 const textDecoder = new TextDecoder();
 let lockFd: number | null = null;
 let overlayProcess: ReturnType<typeof Bun.spawn> | null = null;
+let overlayExpectedExit = false;
+let overlayStartAtMs = 0;
+let overlayConsecutiveCrashCount = 0;
+let overlayLastRestartAt: string | null = null;
+let overlayCommandLine: string | null = null;
 let shuttingDown = false;
 
 function appendLog(line: string) {
@@ -190,10 +197,12 @@ function stopOverlayApp() {
   }
 
   if (!overlayProcess) {
+    overlayCommandLine = null;
     return;
   }
 
   try {
+    overlayExpectedExit = true;
     overlayProcess.kill();
   } catch (error) {
     appendLog(`Error while stopping overlay app: ${String(error)}`);
@@ -201,6 +210,7 @@ function stopOverlayApp() {
 
   overlayProcess = null;
   overlayServerBaseUrl = null;
+  overlayCommandLine = null;
 }
 
 function startOverlayApp(serverBaseUrl: string) {
@@ -250,27 +260,62 @@ function startOverlayApp(serverBaseUrl: string) {
     : [electronPath, ...overlayArgs];
 
   appendLog(`Starting overlay app: ${command.join(" ")}`);
+  overlayCommandLine = command.join(" ");
+  overlayExpectedExit = false;
+  overlayStartAtMs = Date.now();
   const processRef = Bun.spawn(command, {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
     onExit(_, exitCode, signalCode, error) {
-      appendLog(`Overlay app exited (code=${exitCode}, signal=${signalCode}, error=${String(error || "none")})`);
+      const runtimeMs = Math.max(0, Date.now() - overlayStartAtMs);
+      const expectedExit = overlayExpectedExit || shuttingDown;
+
+      if (expectedExit) {
+        appendLog(`Overlay app stopped (code=${exitCode}, signal=${signalCode})`);
+        return;
+      }
+
+      const isCrash = exitCode !== 0;
+      if (isCrash) {
+        if (runtimeMs < overlayMinHealthyRunMs) {
+          overlayConsecutiveCrashCount += 1;
+        } else {
+          overlayConsecutiveCrashCount = 1;
+        }
+      } else {
+        overlayConsecutiveCrashCount = 0;
+      }
+
+      appendLog(
+        `Overlay app exited unexpectedly (code=${exitCode}, signal=${signalCode}, error=${String(error || "none")}, runtimeMs=${runtimeMs}, crashCount=${overlayConsecutiveCrashCount})`,
+      );
     },
   });
 
   overlayProcess = processRef;
   overlayServerBaseUrl = normalizedBaseUrl;
+  overlayLastRestartAt = new Date().toISOString();
   pipeStreamToLogs(processRef.stdout, "overlay-out").catch((error) => appendLog(`overlay stdout pipe error: ${String(error)}`));
   pipeStreamToLogs(processRef.stderr, "overlay-err").catch((error) => appendLog(`overlay stderr pipe error: ${String(error)}`));
 
   processRef.exited.then(() => {
+    const expectedExit = overlayExpectedExit || shuttingDown;
     if (overlayProcess !== processRef) {
       return;
     }
 
     overlayProcess = null;
+    overlayExpectedExit = false;
+    overlayCommandLine = null;
     if (shuttingDown) {
+      return;
+    }
+
+    if (!expectedExit && overlayConsecutiveCrashCount >= overlayMaxConsecutiveCrashes) {
+      appendLog(
+        `Overlay app disabled after ${overlayConsecutiveCrashCount} consecutive startup crashes. Fix Electron overlay and restart client to retry.`,
+      );
       return;
     }
 
@@ -608,6 +653,11 @@ function publishHealth() {
     playing: Boolean(activeProcess),
     lastRestartAt,
     commandLine: currentCommandLine,
+    overlayRunning: Boolean(overlayProcess),
+    overlayPid: overlayProcess?.pid ?? null,
+    overlayLastRestartAt,
+    overlayCommandLine,
+    overlayCrashCount: overlayConsecutiveCrashCount,
   });
 }
 
