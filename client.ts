@@ -97,6 +97,7 @@ let overlayStartAtMs = 0;
 let overlayConsecutiveCrashCount = 0;
 let overlayLastRestartAt: string | null = null;
 let overlayCommandLine: string | null = null;
+let overlayLastCommandLine: string | null = null;
 let shuttingDown = false;
 
 function appendLog(line: string) {
@@ -284,6 +285,7 @@ function startOverlayApp(serverBaseUrl: string) {
 
   appendOverlayLog(`Starting overlay app: ${command.join(" ")}`);
   overlayCommandLine = command.join(" ");
+  overlayLastCommandLine = overlayCommandLine;
   overlayExpectedExit = false;
   overlayStartAtMs = Date.now();
   const processRef = Bun.spawn(command, {
@@ -709,6 +711,7 @@ function publishHealth() {
     overlayPid: overlayProcess?.pid ?? null,
     overlayLastRestartAt,
     overlayCommandLine,
+    overlayLastCommandLine,
     overlayCrashCount: overlayConsecutiveCrashCount,
   });
 }
