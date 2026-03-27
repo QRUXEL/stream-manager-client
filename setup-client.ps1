@@ -1,5 +1,8 @@
 $ErrorActionPreference = 'Stop'
 
+$ExitCodeClientRestart = 90
+$ExitCodeClientForceUpdate = 91
+
 Set-Location -Path $PSScriptRoot
 
 function Refresh-ProcessPath {
@@ -180,4 +183,33 @@ if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
 
 bun --version
 bun install
-bun run client
+
+while ($true) {
+  Write-Host 'Starting client runtime...'
+  bun run client
+  $exitCode = $LASTEXITCODE
+
+  if ($exitCode -eq $ExitCodeClientForceUpdate) {
+    Write-Host 'Client requested FORCE UPDATE. Refreshing from GitHub before restart...'
+    Ensure-GitInstalled
+    Update-ClientFromGitHub
+    bun install
+    Start-Sleep -Seconds 1
+    continue
+  }
+
+  if ($exitCode -eq $ExitCodeClientRestart) {
+    Write-Host 'Client requested restart. Restarting runtime...'
+    Start-Sleep -Seconds 1
+    continue
+  }
+
+  if ($exitCode -eq 0) {
+    Write-Host 'Client exited normally. Restarting runtime...'
+    Start-Sleep -Seconds 1
+    continue
+  }
+
+  Write-Host "Client exited with code $exitCode. Restarting runtime..."
+  Start-Sleep -Seconds 2
+}

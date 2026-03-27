@@ -71,6 +71,8 @@ const overlayAppDir = join(clientDir, "electron-overlay");
 const overlayRestartDelayMs = 2000;
 const overlayMinHealthyRunMs = 5000;
 const overlayMaxConsecutiveCrashes = 5;
+const exitCodeClientRestart = 90;
+const exitCodeClientForceUpdate = 91;
 const mdnsAddress = Bun.env.MDNS_MULTICAST_ADDRESS || "224.0.0.251";
 const mdnsPort = Number(Bun.env.MDNS_PORT || "5353");
 const discoveryTopic = "ffplay-admin-bun-v1";
@@ -86,6 +88,7 @@ let currentCommandLine: string | null = null;
 let lastDiscoveredServerUrl: string | null = null;
 let overlayServerBaseUrl: string | null = null;
 const logs: string[] = [];
+const overlayLogs: string[] = [];
 const textDecoder = new TextDecoder();
 let lockFd: number | null = null;
 let overlayProcess: ReturnType<typeof Bun.spawn> | null = null;
@@ -106,6 +109,26 @@ function appendLog(line: string) {
   logs.push(stamped);
   if (logs.length > 500) {
     logs.splice(0, logs.length - 500);
+  }
+
+  console.log(stamped);
+}
+
+function appendOverlayLog(line: string) {
+  const clean = line.trim();
+  if (!clean) {
+    return;
+  }
+
+  const stamped = `[${new Date().toISOString()}] ${clean}`;
+  logs.push(stamped);
+  if (logs.length > 500) {
+    logs.splice(0, logs.length - 500);
+  }
+
+  overlayLogs.push(stamped);
+  if (overlayLogs.length > 500) {
+    overlayLogs.splice(0, overlayLogs.length - 500);
   }
 
   console.log(stamped);
@@ -205,7 +228,7 @@ function stopOverlayApp() {
     overlayExpectedExit = true;
     overlayProcess.kill();
   } catch (error) {
-    appendLog(`Error while stopping overlay app: ${String(error)}`);
+    appendOverlayLog(`Error while stopping overlay app: ${String(error)}`);
   }
 
   overlayProcess = null;
@@ -220,7 +243,7 @@ function startOverlayApp(serverBaseUrl: string) {
 
   const normalizedBaseUrl = String(serverBaseUrl || "").trim();
   if (!normalizedBaseUrl) {
-    appendLog("Overlay URL is empty; skipping overlay start");
+    appendOverlayLog("Overlay URL is empty; skipping overlay start");
     return;
   }
 
@@ -229,20 +252,20 @@ function startOverlayApp(serverBaseUrl: string) {
       return;
     }
 
-    appendLog(`Overlay target changed to ${normalizedBaseUrl}; restarting overlay app`);
+    appendOverlayLog(`Overlay target changed to ${normalizedBaseUrl}; restarting overlay app`);
     stopOverlayApp();
   }
 
   const electronPath = findElectronExecutable();
   if (!electronPath) {
-    appendLog("Electron executable not found. Overlay app is disabled.");
+    appendOverlayLog("Electron executable not found. Overlay app is disabled.");
     return;
   }
 
   const mainScriptPath = join(overlayAppDir, "main.cjs");
   const packageJsonPath = join(overlayAppDir, "package.json");
   if (!existsSync(mainScriptPath) || !existsSync(packageJsonPath)) {
-    appendLog(`Overlay app not found at ${overlayAppDir}`);
+    appendOverlayLog(`Overlay app not found at ${overlayAppDir}`);
     return;
   }
 
@@ -259,7 +282,7 @@ function startOverlayApp(serverBaseUrl: string) {
     ? ["cmd.exe", "/c", electronPath, ...overlayArgs]
     : [electronPath, ...overlayArgs];
 
-  appendLog(`Starting overlay app: ${command.join(" ")}`);
+  appendOverlayLog(`Starting overlay app: ${command.join(" ")}`);
   overlayCommandLine = command.join(" ");
   overlayExpectedExit = false;
   overlayStartAtMs = Date.now();
@@ -272,7 +295,7 @@ function startOverlayApp(serverBaseUrl: string) {
       const expectedExit = overlayExpectedExit || shuttingDown;
 
       if (expectedExit) {
-        appendLog(`Overlay app stopped (code=${exitCode}, signal=${signalCode})`);
+        appendOverlayLog(`Overlay app stopped (code=${exitCode}, signal=${signalCode})`);
         return;
       }
 
@@ -287,7 +310,7 @@ function startOverlayApp(serverBaseUrl: string) {
         overlayConsecutiveCrashCount = 0;
       }
 
-      appendLog(
+      appendOverlayLog(
         `Overlay app exited unexpectedly (code=${exitCode}, signal=${signalCode}, error=${String(error || "none")}, runtimeMs=${runtimeMs}, crashCount=${overlayConsecutiveCrashCount})`,
       );
     },
@@ -296,8 +319,12 @@ function startOverlayApp(serverBaseUrl: string) {
   overlayProcess = processRef;
   overlayServerBaseUrl = normalizedBaseUrl;
   overlayLastRestartAt = new Date().toISOString();
-  pipeStreamToLogs(processRef.stdout, "overlay-out").catch((error) => appendLog(`overlay stdout pipe error: ${String(error)}`));
-  pipeStreamToLogs(processRef.stderr, "overlay-err").catch((error) => appendLog(`overlay stderr pipe error: ${String(error)}`));
+  pipeStreamToLogs(processRef.stdout, "overlay-out", appendOverlayLog).catch((error) =>
+    appendOverlayLog(`overlay stdout pipe error: ${String(error)}`),
+  );
+  pipeStreamToLogs(processRef.stderr, "overlay-err", appendOverlayLog).catch((error) =>
+    appendOverlayLog(`overlay stderr pipe error: ${String(error)}`),
+  );
 
   processRef.exited.then(() => {
     const expectedExit = overlayExpectedExit || shuttingDown;
@@ -313,7 +340,7 @@ function startOverlayApp(serverBaseUrl: string) {
     }
 
     if (!expectedExit && overlayConsecutiveCrashCount >= overlayMaxConsecutiveCrashes) {
-      appendLog(
+      appendOverlayLog(
         `Overlay app disabled after ${overlayConsecutiveCrashCount} consecutive startup crashes. Fix Electron overlay and restart client to retry.`,
       );
       return;
@@ -367,12 +394,14 @@ function acquireSingleInstanceLock(): boolean {
 function registerShutdownHandlers() {
   process.on("exit", () => {
     shuttingDown = true;
+    killFfplay();
     stopOverlayApp();
     releaseSingleInstanceLock();
   });
 
   process.on("SIGINT", () => {
     shuttingDown = true;
+    killFfplay();
     stopOverlayApp();
     releaseSingleInstanceLock();
     process.exit(0);
@@ -380,10 +409,33 @@ function registerShutdownHandlers() {
 
   process.on("SIGTERM", () => {
     shuttingDown = true;
+    killFfplay();
     stopOverlayApp();
     releaseSingleInstanceLock();
     process.exit(0);
   });
+}
+
+function requestSupervisorAction(action: "restart" | "force_update") {
+  appendLog(`Supervisor action requested: ${action}`);
+  shuttingDown = true;
+
+  if (restartTimer) {
+    clearTimeout(restartTimer);
+    restartTimer = null;
+  }
+
+  if (overlayRestartTimer) {
+    clearTimeout(overlayRestartTimer);
+    overlayRestartTimer = null;
+  }
+
+  killFfplay();
+  stopOverlayApp();
+  releaseSingleInstanceLock();
+
+  const code = action === "force_update" ? exitCodeClientForceUpdate : exitCodeClientRestart;
+  setTimeout(() => process.exit(code), 50);
 }
 
 function normalizeRuntimeConfig(raw: unknown): RuntimeConfig | null {
@@ -661,7 +713,11 @@ function publishHealth() {
   });
 }
 
-async function pipeStreamToLogs(stream: ReadableStream<Uint8Array> | null, label: string) {
+async function pipeStreamToLogs(
+  stream: ReadableStream<Uint8Array> | null,
+  label: string,
+  logger: (line: string) => void = appendLog,
+) {
   if (!stream) {
     return;
   }
@@ -673,7 +729,7 @@ async function pipeStreamToLogs(stream: ReadableStream<Uint8Array> | null, label
     const { value, done } = await reader.read();
     if (done) {
       if (partial) {
-        appendLog(`${label}: ${partial}`);
+        logger(`${label}: ${partial}`);
       }
       break;
     }
@@ -683,7 +739,7 @@ async function pipeStreamToLogs(stream: ReadableStream<Uint8Array> | null, label
     partial = parts.pop() ?? "";
 
     for (const line of parts) {
-      appendLog(`${label}: ${line}`);
+      logger(`${label}: ${line}`);
     }
   }
 }
@@ -941,7 +997,23 @@ async function connect() {
     }
 
     if (msg.type === "request_logs") {
-      send("client_logs", { logs });
+      send("client_logs", { logs, overlayLogs });
+      return;
+    }
+
+    if (msg.type === "control_command") {
+      const action = String(msg.payload?.action || "").trim();
+      if (action === "force_update") {
+        requestSupervisorAction("force_update");
+        return;
+      }
+
+      if (action === "restart") {
+        requestSupervisorAction("restart");
+        return;
+      }
+
+      appendLog(`Unknown control command action: ${action || "(empty)"}`);
       return;
     }
   });
