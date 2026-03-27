@@ -5,6 +5,12 @@ const path = require("node:path");
 const args = process.argv.slice(1);
 
 function readArgValue(flagName, fallbackValue) {
+  const equalsPrefix = `${flagName}=`;
+  const equalsMatch = args.find((item) => typeof item === "string" && item.startsWith(equalsPrefix));
+  if (equalsMatch) {
+    return String(equalsMatch.slice(equalsPrefix.length) || fallbackValue);
+  }
+
   const idx = args.findIndex((item) => item === flagName);
   if (idx < 0 || idx + 1 >= args.length) {
     return fallbackValue;
@@ -12,8 +18,17 @@ function readArgValue(flagName, fallbackValue) {
   return String(args[idx + 1] || fallbackValue);
 }
 
-const clientId = readArgValue("--client-id", "client");
 const overlayUrlArg = readArgValue("--overlay-url", "");
+let clientIdFromUrl = "";
+if (overlayUrlArg) {
+  try {
+    const parsed = new URL(overlayUrlArg);
+    clientIdFromUrl = String(parsed.searchParams.get("clientId") || "").trim();
+  } catch {
+  }
+}
+
+const clientId = readArgValue("--client-id", clientIdFromUrl || "client");
 const userDataPath = path.join(process.cwd(), "overlay-user-data", clientId);
 
 try {

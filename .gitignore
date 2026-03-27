@@ -35,3 +35,4 @@ coverage/
 .idea/
 .DS_Store
 Thumbs.db
+overlay-user-data/client/*

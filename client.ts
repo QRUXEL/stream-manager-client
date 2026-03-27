@@ -275,8 +275,6 @@ function startOverlayApp(serverBaseUrl: string) {
     overlayAppDir,
     "--overlay-url",
     overlayUrl,
-    "--client-id",
-    clientId,
   ];
 
   const command = electronPath.toLowerCase().endsWith(".cmd")
