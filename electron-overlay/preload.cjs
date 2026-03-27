@@ -14,4 +14,7 @@ contextBridge.exposeInMainWorld("overlayApi", {
   log: (payload) => {
     ipcRenderer.send("overlay-log", payload);
   },
+  setClickThrough: (ignore) => {
+    ipcRenderer.send("overlay-set-click-through", { ignore: Boolean(ignore) });
+  },
 });

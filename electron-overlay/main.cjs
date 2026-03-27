@@ -4,6 +4,21 @@ const path = require("node:path");
 
 const args = process.argv.slice(1);
 
+function hasFlag(flagName) {
+  return args.some((item) => {
+    if (item === flagName) {
+      return true;
+    }
+
+    if (typeof item === "string" && item.startsWith(`${flagName}=`)) {
+      const value = String(item.slice(flagName.length + 1)).trim().toLowerCase();
+      return value !== "0" && value !== "false" && value !== "off";
+    }
+
+    return false;
+  });
+}
+
 function readArgValue(flagName, fallbackValue) {
   const equalsPrefix = `${flagName}=`;
   const equalsMatch = args.find((item) => typeof item === "string" && item.startsWith(equalsPrefix));
@@ -29,6 +44,7 @@ if (overlayUrlArg) {
 }
 
 const clientId = readArgValue("--client-id", clientIdFromUrl || "client");
+const debugOverlayWindow = hasFlag("--debug");
 const userDataPath = path.join(process.cwd(), "overlay-user-data", clientId);
 
 try {
@@ -39,6 +55,25 @@ try {
 app.setPath("userData", userDataPath);
 
 let overlayWindow = null;
+let clickThroughEnabled = null;
+
+function setWindowClickThrough(ignore) {
+  if (!overlayWindow || overlayWindow.isDestroyed()) {
+    return;
+  }
+
+  const next = Boolean(ignore);
+  if (clickThroughEnabled === next) {
+    return;
+  }
+
+  clickThroughEnabled = next;
+  if (next) {
+    overlayWindow.setIgnoreMouseEvents(true, { forward: true });
+  } else {
+    overlayWindow.setIgnoreMouseEvents(false);
+  }
+}
 
 function createWindow() {
   overlayWindow = new BrowserWindow({
@@ -52,10 +87,10 @@ function createWindow() {
     resizable: true,
     alwaysOnTop: true,
     skipTaskbar: false,
-    focusable: true,
+    focusable: debugOverlayWindow,
     hasShadow: false,
     backgroundColor: "#00000000",
-    title: `Stream Overlay - ${clientId}`,
+    title: debugOverlayWindow ? `Stream Overlay - ${clientId}` : "Stream Overlay",
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -64,7 +99,7 @@ function createWindow() {
   });
 
   overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-  overlayWindow.setIgnoreMouseEvents(false);
+  setWindowClickThrough(true);
   overlayWindow.setAlwaysOnTop(true, "screen-saver");
   overlayWindow.moveTop();
 
@@ -83,10 +118,12 @@ function createWindow() {
 
   overlayWindow.on("closed", () => {
     overlayWindow = null;
+    clickThroughEnabled = null;
   });
 }
 
 app.whenReady().then(() => {
+  console.log(`[overlay] debug window mode: ${debugOverlayWindow ? "enabled" : "disabled"}`);
   createWindow();
 
   app.on("activate", () => {
@@ -105,4 +142,11 @@ app.on("window-all-closed", () => {
 ipcMain.on("overlay-log", (_event, payload) => {
   const text = typeof payload === "string" ? payload : JSON.stringify(payload);
   console.log(`[overlay] ${text}`);
+});
+
+ipcMain.on("overlay-set-click-through", (_event, payload) => {
+  const ignore = typeof payload === "object" && payload !== null
+    ? Boolean(payload.ignore)
+    : Boolean(payload);
+  setWindowClickThrough(ignore);
 });
