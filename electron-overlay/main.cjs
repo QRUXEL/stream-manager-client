@@ -44,7 +44,11 @@ if (overlayUrlArg) {
 }
 
 const clientId = readArgValue("--client-id", clientIdFromUrl || "client");
-const debugOverlayWindow = hasFlag("--debug");
+const debugOverlayWindow = hasFlag("--overlay-debug") || hasFlag("--debug-overlay");
+
+if (hasFlag("--debug")) {
+  console.warn("[overlay] Ignoring reserved '--debug' flag. Use '--overlay-debug' instead.");
+}
 const userDataPath = path.join(process.cwd(), "overlay-user-data", clientId);
 
 try {

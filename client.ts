@@ -71,6 +71,7 @@ const overlayAppDir = join(clientDir, "electron-overlay");
 const overlayRestartDelayMs = 2000;
 const overlayMinHealthyRunMs = 5000;
 const overlayMaxConsecutiveCrashes = 5;
+const overlayDebugEnabled = ["1", "true", "yes", "on"].includes(String(Bun.env.OVERLAY_DEBUG || "").trim().toLowerCase());
 const exitCodeClientRestart = 90;
 const exitCodeClientForceUpdate = 91;
 const mdnsAddress = Bun.env.MDNS_MULTICAST_ADDRESS || "224.0.0.251";
@@ -276,6 +277,10 @@ function startOverlayApp(serverBaseUrl: string) {
     "--overlay-url",
     overlayUrl,
   ];
+
+  if (overlayDebugEnabled) {
+    overlayArgs.push("--overlay-debug");
+  }
 
   const command = electronPath.toLowerCase().endsWith(".cmd")
     ? ["cmd.exe", "/c", electronPath, ...overlayArgs]
