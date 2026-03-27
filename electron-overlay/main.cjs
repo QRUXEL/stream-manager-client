@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require("electron");
+const { app, BrowserWindow, ipcMain, screen } = require("electron");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -61,6 +61,22 @@ app.setPath("userData", userDataPath);
 let overlayWindow = null;
 let clickThroughEnabled = null;
 
+function logOverlay(text) {
+  console.log(`[overlay] ${text}`);
+}
+
+function logOverlayWarn(text) {
+  console.warn(`[overlay] ${text}`);
+}
+
+function logOverlayError(text, error) {
+  if (error === undefined) {
+    console.error(`[overlay] ${text}`);
+    return;
+  }
+  console.error(`[overlay] ${text}`, error);
+}
+
 function setWindowClickThrough(ignore) {
   if (!overlayWindow || overlayWindow.isDestroyed()) {
     return;
@@ -80,15 +96,20 @@ function setWindowClickThrough(ignore) {
 }
 
 function createWindow() {
+  logOverlay(`Creating overlay window for clientId=${clientId}`);
+  const targetDisplay = screen.getPrimaryDisplay();
+  const bounds = targetDisplay?.bounds || { x: 0, y: 0, width: 1920, height: 1080 };
+  logOverlay(`Overlay window bounds x=${bounds.x} y=${bounds.y} width=${bounds.width} height=${bounds.height}`);
+
   overlayWindow = new BrowserWindow({
-    width: 900,
-    height: 220,
-    x: 20,
-    y: 20,
+    width: Math.max(1, Number(bounds.width) || 1920),
+    height: Math.max(1, Number(bounds.height) || 1080),
+    x: Number(bounds.x) || 0,
+    y: Number(bounds.y) || 0,
     show: true,
     transparent: true,
     frame: false,
-    resizable: true,
+    resizable: false,
     alwaysOnTop: true,
     skipTaskbar: false,
     focusable: debugOverlayWindow,
@@ -112,18 +133,62 @@ function createWindow() {
       ? overlayUrlArg
       : `http://127.0.0.1:3500/overlay?clientId=${encodeURIComponent(clientId)}`;
 
+  const wc = overlayWindow.webContents;
+  wc.on("did-start-loading", () => {
+    logOverlay(`Loading overlay webpage: ${resolvedOverlayUrl}`);
+  });
+
+  wc.on("dom-ready", () => {
+    logOverlay("Overlay webpage DOM ready");
+  });
+
+  wc.on("did-finish-load", () => {
+    logOverlay(`Connected to webpage: ${wc.getURL()}`);
+  });
+
+  wc.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    if (!isMainFrame) {
+      return;
+    }
+    logOverlayError(`Webpage load failed code=${errorCode} url=${validatedURL} description=${errorDescription}`);
+  });
+
+  wc.on("render-process-gone", (_event, details) => {
+    logOverlayError(`Renderer process gone: reason=${String(details?.reason || "unknown")} exitCode=${String(details?.exitCode ?? "unknown")}`);
+  });
+
+  wc.on("console-message", (_event, details) => {
+    const level = Number(details?.level ?? 0);
+    const message = String(details?.message ?? "");
+    const line = Number(details?.lineNumber ?? 0);
+    const sourceId = String(details?.sourceId ?? "");
+
+    if (message.includes("Electron Security Warning")) {
+      return;
+    }
+
+    const prefix = `renderer-console level=${level} line=${line} source=${sourceId || "(unknown)"}`;
+    if (level >= 2) {
+      logOverlayWarn(`${prefix} ${message}`);
+      return;
+    }
+    logOverlay(`${prefix} ${message}`);
+  });
+
   overlayWindow.loadURL(resolvedOverlayUrl).catch((error) => {
-    console.error(`[overlay] Failed to load remote overlay URL (${resolvedOverlayUrl}):`, error);
+    logOverlayError(`Failed to load remote overlay URL (${resolvedOverlayUrl})`, error);
   });
 
   overlayWindow.on("closed", () => {
+    logOverlay("Overlay window closed");
     overlayWindow = null;
     clickThroughEnabled = null;
   });
 }
 
 app.whenReady().then(() => {
-  console.log(`[overlay] debug window mode: ${debugOverlayWindow ? "enabled" : "disabled"}`);
+  logOverlay(`debug window mode: ${debugOverlayWindow ? "enabled" : "disabled"}`);
+  logOverlay(`userData path: ${userDataPath}`);
   createWindow();
 
   app.on("activate", () => {
@@ -141,7 +206,7 @@ app.on("window-all-closed", () => {
 
 ipcMain.on("overlay-log", (_event, payload) => {
   const text = typeof payload === "string" ? payload : JSON.stringify(payload);
-  console.log(`[overlay] ${text}`);
+  logOverlay(text);
 });
 
 ipcMain.on("overlay-set-click-through", (_event, payload) => {
