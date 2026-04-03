@@ -58,6 +58,8 @@ type RuntimeConfig = {
   stream: StreamConfig | null;
   globalFfplaySettings: GlobalFfplaySettings;
   clientSettings: ClientSettings;
+  serverPauseEnabled: boolean;
+  serverPauseMessage: string;
 };
 
 const configuredServerUrl = Bun.env.SERVER_URL;
@@ -481,6 +483,8 @@ function normalizeRuntimeConfig(raw: unknown): RuntimeConfig | null {
   const windowY = Number(clientRaw.windowY);
   const logLevelRaw = String(globalRaw.logLevel ?? "info");
   const syncModeRaw = String(globalRaw.syncMode ?? "audio");
+  const serverPauseEnabled = Boolean(value.serverPauseEnabled);
+  const serverPauseMessage = String(value.serverPauseMessage ?? "").trim();
   const allowedLogLevels = new Set(["quiet", "panic", "fatal", "error", "warning", "info", "verbose", "debug", "trace"]);
   const allowedSyncModes = new Set(["audio", "video", "ext"]);
 
@@ -588,6 +592,8 @@ function normalizeRuntimeConfig(raw: unknown): RuntimeConfig | null {
       genPts: Boolean(clientRaw.genPts),
       extraArgs: String(clientRaw.extraArgs ?? ""),
     },
+    serverPauseEnabled,
+    serverPauseMessage,
   };
 }
 
@@ -871,6 +877,13 @@ function buildFfplayArgs(config: RuntimeConfig) {
 }
 
 async function startFfplay(config: RuntimeConfig) {
+  if (config.serverPauseEnabled) {
+    const reason = config.serverPauseMessage || "Video server paused";
+    appendLog(`Server pause mode is enabled (${reason}), ffplay remains stopped`);
+    killFfplay();
+    return;
+  }
+
   if (!config.clientSettings.playEnabled) {
     appendLog("Play is disabled by admin, ffplay remains stopped");
     killFfplay();
@@ -916,7 +929,7 @@ async function startFfplay(config: RuntimeConfig) {
     }
 
     activeProcess = null;
-    if (desiredConfig?.stream && desiredConfig.clientSettings.playEnabled) {
+    if (desiredConfig?.stream && desiredConfig.clientSettings.playEnabled && !desiredConfig.serverPauseEnabled) {
       appendLog("ffplay stopped unexpectedly; scheduling restart");
       if (restartTimer) {
         clearTimeout(restartTimer);
