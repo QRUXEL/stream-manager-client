@@ -101,7 +101,58 @@ let overlayConsecutiveCrashCount = 0;
 let overlayLastRestartAt: string | null = null;
 let overlayCommandLine: string | null = null;
 let overlayLastCommandLine: string | null = null;
+let videoTimestampText: string | null = null;
+let videoTimestampUpdatedAt: string | null = null;
 let shuttingDown = false;
+
+function formatSecondsAsClock(totalSecondsRaw: number) {
+  const totalSeconds = Number.isFinite(totalSecondsRaw) ? Math.max(0, totalSecondsRaw) : 0;
+  const wholeSeconds = Math.floor(totalSeconds);
+  const hours = Math.floor(wholeSeconds / 3600);
+  const minutes = Math.floor((wholeSeconds % 3600) / 60);
+  const seconds = wholeSeconds % 60;
+  const millis = Math.floor((totalSeconds - wholeSeconds) * 1000);
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
+}
+
+function resetVideoTimestamp() {
+  videoTimestampText = null;
+  videoTimestampUpdatedAt = null;
+}
+
+function extractVideoTimestampFromFfplayLine(lineRaw: string) {
+  const line = String(lineRaw || "").trim();
+  if (!line) {
+    return null;
+  }
+
+  const explicitTimeMatch = line.match(/\btime=(\d{1,2}:\d{2}:\d{2}(?:\.\d+)?)\b/i);
+  if (explicitTimeMatch?.[1]) {
+    return explicitTimeMatch[1];
+  }
+
+  const ffplayStatsClockMatch = line.match(/^\s*([0-9]+(?:\.[0-9]+)?)\s+M-V:/i);
+  if (ffplayStatsClockMatch?.[1]) {
+    return formatSecondsAsClock(Number(ffplayStatsClockMatch[1]));
+  }
+
+  const genericClockMatch = line.match(/\b(\d{1,2}:\d{2}:\d{2}(?:\.\d+)?)\b/);
+  if (genericClockMatch?.[1]) {
+    return genericClockMatch[1];
+  }
+
+  return null;
+}
+
+function updateVideoTimestampFromFfplayLine(lineRaw: string) {
+  const extracted = extractVideoTimestampFromFfplayLine(lineRaw);
+  if (!extracted) {
+    return;
+  }
+
+  videoTimestampText = extracted;
+  videoTimestampUpdatedAt = new Date().toISOString();
+}
 
 function appendLog(line: string) {
   const clean = line.trim();
@@ -722,6 +773,8 @@ function publishHealth() {
     overlayCommandLine,
     overlayLastCommandLine,
     overlayCrashCount: overlayConsecutiveCrashCount,
+    videoTimestamp: videoTimestampText,
+    videoTimestampUpdatedAt,
   });
 }
 
@@ -729,6 +782,7 @@ async function pipeStreamToLogs(
   stream: ReadableStream<Uint8Array> | null,
   label: string,
   logger: (line: string) => void = appendLog,
+  onLine?: (line: string) => void,
 ) {
   if (!stream) {
     return;
@@ -751,6 +805,7 @@ async function pipeStreamToLogs(
     partial = parts.pop() ?? "";
 
     for (const line of parts) {
+      onLine?.(line);
       logger(`${label}: ${line}`);
     }
   }
@@ -770,6 +825,7 @@ function killFfplay() {
   }
   activeProcess = null;
   currentCommandLine = null;
+  resetVideoTimestamp();
 }
 
 function buildFfplayArgs(config: RuntimeConfig) {
@@ -903,6 +959,7 @@ async function startFfplay(config: RuntimeConfig) {
   }
 
   killFfplay();
+  resetVideoTimestamp();
 
   const args = buildFfplayArgs(config);
   currentCommandLine = buildCommandLine(ffplayPath, args);
@@ -920,8 +977,10 @@ async function startFfplay(config: RuntimeConfig) {
   activeProcess = processRef;
   lastRestartAt = new Date().toISOString();
 
-  pipeStreamToLogs(processRef.stdout, "stdout").catch((error) => appendLog(`stdout pipe error: ${String(error)}`));
-  pipeStreamToLogs(processRef.stderr, "stderr").catch((error) => appendLog(`stderr pipe error: ${String(error)}`));
+  pipeStreamToLogs(processRef.stdout, "stdout", appendLog, updateVideoTimestampFromFfplayLine)
+    .catch((error) => appendLog(`stdout pipe error: ${String(error)}`));
+  pipeStreamToLogs(processRef.stderr, "stderr", appendLog, updateVideoTimestampFromFfplayLine)
+    .catch((error) => appendLog(`stderr pipe error: ${String(error)}`));
 
   processRef.exited.then(() => {
     if (activeProcess !== processRef) {
@@ -929,6 +988,7 @@ async function startFfplay(config: RuntimeConfig) {
     }
 
     activeProcess = null;
+    resetVideoTimestamp();
     if (desiredConfig?.stream && desiredConfig.clientSettings.playEnabled && !desiredConfig.serverPauseEnabled) {
       appendLog("ffplay stopped unexpectedly; scheduling restart");
       if (restartTimer) {
