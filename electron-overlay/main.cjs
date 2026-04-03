@@ -77,6 +77,14 @@ function logOverlayError(text, error) {
   console.error(`[overlay] ${text}`, error);
 }
 
+process.on("uncaughtException", (error) => {
+  logOverlayError("uncaughtException in overlay main process", error);
+});
+
+process.on("unhandledRejection", (reason) => {
+  logOverlayError("unhandledRejection in overlay main process", reason);
+});
+
 function setWindowClickThrough(ignore) {
   if (!overlayWindow || overlayWindow.isDestroyed()) {
     return;
@@ -151,6 +159,13 @@ function createWindow() {
       return;
     }
     logOverlayError(`Webpage load failed code=${errorCode} url=${validatedURL} description=${errorDescription}`);
+  });
+
+  wc.on("javascript-dialog-opening", (event, message, defaultPrompt, type, url) => {
+    event.preventDefault();
+    logOverlayWarn(
+      `Suppressed javascript dialog type=${String(type || "unknown")} url=${String(url || "")} message=${String(message || "")} defaultPrompt=${String(defaultPrompt || "")}`,
+    );
   });
 
   wc.on("render-process-gone", (_event, details) => {
