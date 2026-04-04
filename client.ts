@@ -113,6 +113,7 @@ let appliedLatencyOffsetMs = 0;
 let bufferWindowMs: number | null = null;
 let bufferHeadroomMs: number | null = null;
 let shuttingDown = false;
+let gstreamerHelpTextCache: string | null = null;
 
 function clearDelayedStartTimer() {
   if (delayedStartTimer) {
@@ -969,16 +970,68 @@ function spawnFfplayNow(config: RuntimeConfig) {
 
 function buildGstreamerArgs(config: RuntimeConfig) {
   const args: string[] = ["--no-interactive"];
+  let fullscreenViaFlag = false;
+
+  if (config.globalFfplaySettings.fullScreen.enabled && config.globalFfplaySettings.fullScreen.value) {
+    const fullscreenFlag = resolveGstreamerFullscreenFlag();
+    if (fullscreenFlag) {
+      args.push(fullscreenFlag);
+      fullscreenViaFlag = true;
+    }
+  }
 
   if (config.stream?.url) {
     args.push(config.stream.url);
   }
 
-  return args;
+  return { args, fullscreenViaFlag };
+}
+
+function getGstreamerHelpText() {
+  if (gstreamerHelpTextCache !== null) {
+    return gstreamerHelpTextCache;
+  }
+
+  try {
+    const helpResult = Bun.spawnSync([gstreamerPath, "--help"], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const stdoutText = helpResult.stdout ? textDecoder.decode(helpResult.stdout).toLowerCase() : "";
+    const stderrText = helpResult.stderr ? textDecoder.decode(helpResult.stderr).toLowerCase() : "";
+    gstreamerHelpTextCache = `${stdoutText}\n${stderrText}`;
+  } catch {
+    gstreamerHelpTextCache = "";
+  }
+
+  return gstreamerHelpTextCache;
+}
+
+function resolveGstreamerFullscreenFlag() {
+  const helpText = getGstreamerHelpText();
+  if (!helpText) {
+    return null;
+  }
+
+  if (helpText.includes("--fullscreen")) {
+    return "--fullscreen";
+  }
+
+  if (helpText.includes("--full-screen")) {
+    return "--full-screen";
+  }
+
+  if (helpText.match(/\s-f[,\s]/)) {
+    return "-f";
+  }
+
+  return null;
 }
 
 function spawnGstreamerNow(config: RuntimeConfig) {
-  const args = buildGstreamerArgs(config);
+  const { args, fullscreenViaFlag } = buildGstreamerArgs(config);
   currentCommandLine = buildCommandLine(gstreamerPath, args);
   appendLog(`Starting gstreamer: ${gstreamerPath} ${args.join(" ")}`);
 
@@ -999,6 +1052,16 @@ function spawnGstreamerNow(config: RuntimeConfig) {
     .catch((error) => appendLog(`gstreamer stdout pipe error: ${String(error)}`));
   pipeStreamToLogs(processRef.stderr, "gst-stderr", appendLog, updateVideoTimestampFromFfplayLine)
     .catch((error) => appendLog(`gstreamer stderr pipe error: ${String(error)}`));
+
+  if (config.globalFfplaySettings.fullScreen.enabled && config.globalFfplaySettings.fullScreen.value && !fullscreenViaFlag) {
+    appendLog("GStreamer fullscreen flag is unavailable; attempting fullscreen toggle via stdin keypress");
+    setTimeout(() => {
+      if (activeProcess !== processRef) {
+        return;
+      }
+      writeToActivePlayerStdin("f").catch((error) => appendLog(`Failed to send fullscreen toggle to gstreamer: ${String(error)}`));
+    }, 1200);
+  }
 
   processRef.exited.then(() => {
     if (activeProcess !== processRef) {
