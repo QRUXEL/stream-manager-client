@@ -163,13 +163,14 @@ function Find-GstreamerExecutableFromCommonPaths {
 function Find-GstreamerExecutableWithWhere {
   $commands = @('gst-play-1.0.exe', 'gst-play-1.0', 'gst-launch-1.0.exe', 'gst-launch-1.0')
   foreach ($commandName in $commands) {
-    $matches = (& where.exe $commandName 2>$null)
+    $cmdOutput = (& cmd.exe /c "where $commandName 2>nul")
+    $matches = @($cmdOutput | ForEach-Object { ($_ | Out-String).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($LASTEXITCODE -ne 0 -or -not $matches) {
       continue
     }
 
     foreach ($match in $matches) {
-      $candidate = ($match | Out-String).Trim()
+      $candidate = $match
       if ([string]::IsNullOrWhiteSpace($candidate)) {
         continue
       }
