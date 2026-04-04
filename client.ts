@@ -970,19 +970,6 @@ function spawnFfplayNow(config: RuntimeConfig) {
 function buildGstreamerArgs(config: RuntimeConfig) {
   const args: string[] = ["--no-interactive"];
 
-  if (config.globalFfplaySettings.fullScreen.enabled && config.globalFfplaySettings.fullScreen.value) {
-    args.push("--fullscreen");
-  }
-
-  if (config.globalFfplaySettings.mute.enabled && config.globalFfplaySettings.mute.value) {
-    args.push("--mute");
-  }
-
-  if (config.globalFfplaySettings.volume.enabled) {
-    const volumePercent = Math.max(0, Math.min(200, Math.round(config.globalFfplaySettings.volume.value ?? 100)));
-    args.push("--volume", String(volumePercent));
-  }
-
   if (config.stream?.url) {
     args.push(config.stream.url);
   }
