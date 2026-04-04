@@ -84,6 +84,79 @@ function Ensure-FfplayInstalled {
   Copy-Item -Path $ffplaySource -Destination $localFfplayPath -Force
 }
 
+function Get-GstreamerCommand {
+  $gstPlay = Get-Command gst-play-1.0.exe -ErrorAction SilentlyContinue
+  if ($gstPlay) {
+    return $gstPlay
+  }
+
+  $gstPlay = Get-Command gst-play-1.0 -ErrorAction SilentlyContinue
+  if ($gstPlay) {
+    return $gstPlay
+  }
+
+  $gstLaunch = Get-Command gst-launch-1.0.exe -ErrorAction SilentlyContinue
+  if ($gstLaunch) {
+    return $gstLaunch
+  }
+
+  return (Get-Command gst-launch-1.0 -ErrorAction SilentlyContinue)
+}
+
+function Ensure-GstreamerInstalled {
+  $gstCommand = Get-GstreamerCommand
+  if (-not $gstCommand) {
+    Write-Host 'GStreamer not found. Installing with winget...'
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+      throw 'winget is not available; cannot auto-install GStreamer.'
+    }
+
+    $packageIds = @(
+      'GStreamer.GStreamer',
+      'GStreamer.GStreamer.1.0',
+      'GStreamerProject.GStreamer'
+    )
+
+    $installed = $false
+    foreach ($packageId in $packageIds) {
+      winget install --id $packageId -e --source winget --accept-package-agreements --accept-source-agreements
+      if ($LASTEXITCODE -eq 0) {
+        $installed = $true
+        break
+      }
+    }
+
+    if (-not $installed) {
+      Write-Host 'GStreamer install by package ID failed. Trying name-based install...'
+      winget install --name GStreamer -e --source winget --accept-package-agreements --accept-source-agreements
+      if ($LASTEXITCODE -ne 0) {
+        throw 'GStreamer installation via winget failed.'
+      }
+    }
+
+    Refresh-ProcessPath
+    $gstCommand = Get-GstreamerCommand
+  }
+
+  if (-not $gstCommand) {
+    throw 'GStreamer was not found after installation.'
+  }
+
+  $gstSource = $gstCommand.Source
+  if ([string]::IsNullOrWhiteSpace($gstSource) -and $gstCommand.PSObject.Properties['Path']) {
+    $gstSource = $gstCommand.Path
+  }
+
+  if ([string]::IsNullOrWhiteSpace($gstSource) -or -not (Test-Path -Path $gstSource)) {
+    throw 'Unable to resolve GStreamer executable path after installation.'
+  }
+
+  & $gstSource --version *> $null
+  if ($LASTEXITCODE -ne 0) {
+    throw 'GStreamer command was found but failed to execute.'
+  }
+}
+
 function Update-ClientFromGitHub {
   $repoRoot = (& git rev-parse --show-toplevel 2>$null)
   if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) {
@@ -163,6 +236,7 @@ function Update-ClientFromGitHub {
 Ensure-GitInstalled
 Update-ClientFromGitHub
 Ensure-FfplayInstalled
+Ensure-GstreamerInstalled
 
 if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
   Write-Host 'Installing Bun...'

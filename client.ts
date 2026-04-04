@@ -52,12 +52,14 @@ type ClientSettings = {
   fastDecode: boolean;
   genPts: boolean;
   extraArgs: string;
+  playerBackend: "ffplay" | "gstreamer";
 };
 
 type RuntimeConfig = {
   stream: StreamConfig | null;
   globalFfplaySettings: GlobalFfplaySettings;
   clientSettings: ClientSettings;
+  streamLatencyOffsetMs: number;
   serverPauseEnabled: boolean;
   serverPauseMessage: string;
 };
@@ -67,6 +69,7 @@ const clientId = Bun.env.CLIENT_ID || Bun.env.COMPUTERNAME || `client-${crypto.r
 const clientName = Bun.env.CLIENT_NAME || clientId;
 const clientDir = import.meta.dir;
 const ffplayPath = join(clientDir, "ffplay.exe");
+const gstreamerPath = String(Bun.env.GSTREAMER_PATH || "").trim() || "gst-play-1.0";
 const persistedConfigPath = "./last-config.json";
 const lockFilePath = "./client.lock";
 const overlayAppDir = join(clientDir, "electron-overlay");
@@ -85,6 +88,8 @@ let reconnectDelayMs = 1000;
 let activeProcess: ReturnType<typeof Bun.spawn> | null = null;
 let desiredConfig: RuntimeConfig | null = null;
 let restartTimer: ReturnType<typeof setTimeout> | null = null;
+let delayedStartTimer: ReturnType<typeof setTimeout> | null = null;
+let delayedStartUntilMs: number | null = null;
 let overlayRestartTimer: ReturnType<typeof setTimeout> | null = null;
 let lastRestartAt: string | null = null;
 let currentCommandLine: string | null = null;
@@ -92,6 +97,7 @@ let lastDiscoveredServerUrl: string | null = null;
 let overlayServerBaseUrl: string | null = null;
 const logs: string[] = [];
 const overlayLogs: string[] = [];
+const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 let lockFd: number | null = null;
 let overlayProcess: ReturnType<typeof Bun.spawn> | null = null;
@@ -103,7 +109,18 @@ let overlayCommandLine: string | null = null;
 let overlayLastCommandLine: string | null = null;
 let videoTimestampText: string | null = null;
 let videoTimestampUpdatedAt: string | null = null;
+let appliedLatencyOffsetMs = 0;
+let bufferWindowMs: number | null = null;
+let bufferHeadroomMs: number | null = null;
 let shuttingDown = false;
+
+function clearDelayedStartTimer() {
+  if (delayedStartTimer) {
+    clearTimeout(delayedStartTimer);
+    delayedStartTimer = null;
+  }
+  delayedStartUntilMs = null;
+}
 
 function formatSecondsAsClock(totalSecondsRaw: number) {
   const totalSeconds = Number.isFinite(totalSecondsRaw) ? Math.max(0, totalSecondsRaw) : 0;
@@ -118,6 +135,51 @@ function formatSecondsAsClock(totalSecondsRaw: number) {
 function resetVideoTimestamp() {
   videoTimestampText = null;
   videoTimestampUpdatedAt = null;
+  bufferWindowMs = null;
+  bufferHeadroomMs = null;
+}
+
+async function writeToActivePlayerStdin(input: string) {
+  if (!activeProcess) {
+    return false;
+  }
+
+  const stdinStream = (activeProcess as any).stdin as WritableStream<Uint8Array> | undefined;
+  if (!stdinStream || typeof (stdinStream as any).getWriter !== "function") {
+    return false;
+  }
+
+  try {
+    const writer = stdinStream.getWriter();
+    await writer.write(textEncoder.encode(input));
+    writer.releaseLock();
+    return true;
+  } catch (error) {
+    appendLog(`Failed writing to player stdin: ${String(error)}`);
+    return false;
+  }
+}
+
+async function applyLiveSyncNudge(deltaMsRaw: unknown) {
+  const deltaMs = Math.max(0, Math.min(5000, Math.round(Number(deltaMsRaw) || 0)));
+  if (deltaMs <= 0) {
+    return false;
+  }
+
+  if (!desiredConfig || desiredConfig.clientSettings.playerBackend !== "gstreamer") {
+    return false;
+  }
+
+  const paused = await writeToActivePlayerStdin(" ");
+  if (!paused) {
+    return false;
+  }
+
+  appendLog(`Applying live gstreamer sync nudge: +${deltaMs}ms pause`);
+  setTimeout(() => {
+    writeToActivePlayerStdin(" ").catch((error) => appendLog(`Failed to resume after sync nudge: ${String(error)}`));
+  }, deltaMs);
+  return true;
 }
 
 function extractVideoTimestampFromFfplayLine(lineRaw: string) {
@@ -483,6 +545,8 @@ function requestSupervisorAction(action: "restart" | "force_update") {
     restartTimer = null;
   }
 
+  clearDelayedStartTimer();
+
   if (overlayRestartTimer) {
     clearTimeout(overlayRestartTimer);
     overlayRestartTimer = null;
@@ -534,6 +598,10 @@ function normalizeRuntimeConfig(raw: unknown): RuntimeConfig | null {
   const windowY = Number(clientRaw.windowY);
   const logLevelRaw = String(globalRaw.logLevel ?? "info");
   const syncModeRaw = String(globalRaw.syncMode ?? "audio");
+  const streamLatencyOffsetMsRaw = Number(value.streamLatencyOffsetMs ?? 0);
+  const streamLatencyOffsetMs = Number.isFinite(streamLatencyOffsetMsRaw)
+    ? Math.max(-120000, Math.min(120000, Math.round(streamLatencyOffsetMsRaw)))
+    : 0;
   const serverPauseEnabled = Boolean(value.serverPauseEnabled);
   const serverPauseMessage = String(value.serverPauseMessage ?? "").trim();
   const allowedLogLevels = new Set(["quiet", "panic", "fatal", "error", "warning", "info", "verbose", "debug", "trace"]);
@@ -642,7 +710,9 @@ function normalizeRuntimeConfig(raw: unknown): RuntimeConfig | null {
       fastDecode: Boolean(clientRaw.fastDecode),
       genPts: Boolean(clientRaw.genPts),
       extraArgs: String(clientRaw.extraArgs ?? ""),
+      playerBackend: String(clientRaw.playerBackend || "ffplay").trim().toLowerCase() === "gstreamer" ? "gstreamer" : "ffplay",
     },
+    streamLatencyOffsetMs,
     serverPauseEnabled,
     serverPauseMessage,
   };
@@ -760,6 +830,22 @@ function discoverServerUrl(timeoutMs = 4000): Promise<string | null> {
 }
 
 function publishHealth() {
+  const nowMs = Date.now();
+  const delayedStartRemainingMs = delayedStartUntilMs ? Math.max(0, delayedStartUntilMs - nowMs) : 0;
+  const nextBufferWindowMs = delayedStartRemainingMs > 0
+    ? delayedStartRemainingMs
+    : activeProcess
+      ? Math.max(0, appliedLatencyOffsetMs)
+      : null;
+  const nextBufferHeadroomMs = delayedStartRemainingMs > 0
+    ? delayedStartRemainingMs
+    : activeProcess
+      ? Math.max(0, appliedLatencyOffsetMs)
+      : null;
+
+  bufferWindowMs = nextBufferWindowMs;
+  bufferHeadroomMs = nextBufferHeadroomMs;
+
   send("client_health", {
     uptimeSec: Math.floor(process.uptime()),
     memoryRss: process.memoryUsage().rss,
@@ -775,6 +861,9 @@ function publishHealth() {
     overlayCrashCount: overlayConsecutiveCrashCount,
     videoTimestamp: videoTimestampText,
     videoTimestampUpdatedAt,
+    appliedLatencyOffsetMs,
+    bufferWindowMs: nextBufferWindowMs,
+    bufferHeadroomMs: nextBufferHeadroomMs,
   });
 }
 
@@ -812,8 +901,11 @@ async function pipeStreamToLogs(
 }
 
 function killFfplay() {
+  clearDelayedStartTimer();
+
   if (!activeProcess) {
     currentCommandLine = null;
+    appliedLatencyOffsetMs = 0;
     return;
   }
 
@@ -825,7 +917,123 @@ function killFfplay() {
   }
   activeProcess = null;
   currentCommandLine = null;
+  appliedLatencyOffsetMs = 0;
   resetVideoTimestamp();
+}
+
+function spawnFfplayNow(config: RuntimeConfig) {
+  const args = buildFfplayArgs(config);
+  currentCommandLine = buildCommandLine(ffplayPath, args);
+  appendLog(`Starting ffplay: ${ffplayPath} ${args.join(" ")}`);
+
+  const processRef = Bun.spawn([ffplayPath, ...args], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    onExit(_, exitCode, signalCode, error) {
+      appendLog(`ffplay exited (code=${exitCode}, signal=${signalCode}, error=${String(error || "none")})`);
+    },
+  });
+
+  activeProcess = processRef;
+  appliedLatencyOffsetMs = Math.max(0, Math.round(config.streamLatencyOffsetMs || 0));
+  lastRestartAt = new Date().toISOString();
+
+  pipeStreamToLogs(processRef.stdout, "stdout", appendLog, updateVideoTimestampFromFfplayLine)
+    .catch((error) => appendLog(`stdout pipe error: ${String(error)}`));
+  pipeStreamToLogs(processRef.stderr, "stderr", appendLog, updateVideoTimestampFromFfplayLine)
+    .catch((error) => appendLog(`stderr pipe error: ${String(error)}`));
+
+  processRef.exited.then(() => {
+    if (activeProcess !== processRef) {
+      return;
+    }
+
+    activeProcess = null;
+    appliedLatencyOffsetMs = 0;
+    resetVideoTimestamp();
+    if (desiredConfig?.stream && desiredConfig.clientSettings.playEnabled && !desiredConfig.serverPauseEnabled) {
+      appendLog("ffplay stopped unexpectedly; scheduling restart");
+      if (restartTimer) {
+        clearTimeout(restartTimer);
+      }
+      restartTimer = setTimeout(() => {
+        restartTimer = null;
+        if (desiredConfig) {
+          startPlayback(desiredConfig).catch((error) => appendLog(`Failed to restart playback: ${String(error)}`));
+        }
+      }, 1000);
+    }
+  });
+}
+
+function buildGstreamerArgs(config: RuntimeConfig) {
+  const args: string[] = ["--no-interactive"];
+
+  if (config.globalFfplaySettings.fullScreen.enabled && config.globalFfplaySettings.fullScreen.value) {
+    args.push("--fullscreen");
+  }
+
+  if (config.globalFfplaySettings.mute.enabled && config.globalFfplaySettings.mute.value) {
+    args.push("--mute");
+  }
+
+  if (config.globalFfplaySettings.volume.enabled) {
+    const volumePercent = Math.max(0, Math.min(200, Math.round(config.globalFfplaySettings.volume.value ?? 100)));
+    args.push("--volume", String(volumePercent));
+  }
+
+  if (config.stream?.url) {
+    args.push(config.stream.url);
+  }
+
+  return args;
+}
+
+function spawnGstreamerNow(config: RuntimeConfig) {
+  const args = buildGstreamerArgs(config);
+  currentCommandLine = buildCommandLine(gstreamerPath, args);
+  appendLog(`Starting gstreamer: ${gstreamerPath} ${args.join(" ")}`);
+
+  const processRef = Bun.spawn([gstreamerPath, ...args], {
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+    onExit(_, exitCode, signalCode, error) {
+      appendLog(`gstreamer exited (code=${exitCode}, signal=${signalCode}, error=${String(error || "none")})`);
+    },
+  });
+
+  activeProcess = processRef;
+  appliedLatencyOffsetMs = Math.max(0, Math.round(config.streamLatencyOffsetMs || 0));
+  lastRestartAt = new Date().toISOString();
+
+  pipeStreamToLogs(processRef.stdout, "gst-stdout", appendLog, updateVideoTimestampFromFfplayLine)
+    .catch((error) => appendLog(`gstreamer stdout pipe error: ${String(error)}`));
+  pipeStreamToLogs(processRef.stderr, "gst-stderr", appendLog, updateVideoTimestampFromFfplayLine)
+    .catch((error) => appendLog(`gstreamer stderr pipe error: ${String(error)}`));
+
+  processRef.exited.then(() => {
+    if (activeProcess !== processRef) {
+      return;
+    }
+
+    activeProcess = null;
+    appliedLatencyOffsetMs = 0;
+    resetVideoTimestamp();
+    if (desiredConfig?.stream && desiredConfig.clientSettings.playEnabled && !desiredConfig.serverPauseEnabled) {
+      appendLog("gstreamer stopped unexpectedly; scheduling restart");
+      if (restartTimer) {
+        clearTimeout(restartTimer);
+      }
+      restartTimer = setTimeout(() => {
+        restartTimer = null;
+        if (desiredConfig) {
+          startPlayback(desiredConfig).catch((error) => appendLog(`Failed to restart playback: ${String(error)}`));
+        }
+      }, 1000);
+    }
+  });
 }
 
 function buildFfplayArgs(config: RuntimeConfig) {
@@ -961,47 +1169,132 @@ async function startFfplay(config: RuntimeConfig) {
   killFfplay();
   resetVideoTimestamp();
 
-  const args = buildFfplayArgs(config);
-  currentCommandLine = buildCommandLine(ffplayPath, args);
-  appendLog(`Starting ffplay: ${ffplayPath} ${args.join(" ")}`);
-
-  const processRef = Bun.spawn([ffplayPath, ...args], {
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-    onExit(_, exitCode, signalCode, error) {
-      appendLog(`ffplay exited (code=${exitCode}, signal=${signalCode}, error=${String(error || "none")})`);
-    },
-  });
-
-  activeProcess = processRef;
-  lastRestartAt = new Date().toISOString();
-
-  pipeStreamToLogs(processRef.stdout, "stdout", appendLog, updateVideoTimestampFromFfplayLine)
-    .catch((error) => appendLog(`stdout pipe error: ${String(error)}`));
-  pipeStreamToLogs(processRef.stderr, "stderr", appendLog, updateVideoTimestampFromFfplayLine)
-    .catch((error) => appendLog(`stderr pipe error: ${String(error)}`));
-
-  processRef.exited.then(() => {
-    if (activeProcess !== processRef) {
-      return;
-    }
-
-    activeProcess = null;
-    resetVideoTimestamp();
-    if (desiredConfig?.stream && desiredConfig.clientSettings.playEnabled && !desiredConfig.serverPauseEnabled) {
-      appendLog("ffplay stopped unexpectedly; scheduling restart");
-      if (restartTimer) {
-        clearTimeout(restartTimer);
+  const requestedDelayMs = Math.max(0, Math.round(config.streamLatencyOffsetMs || 0));
+  if (requestedDelayMs > 0) {
+    appendLog(`Applying stream latency delay of ${requestedDelayMs}ms before ffplay start`);
+    delayedStartUntilMs = Date.now() + requestedDelayMs;
+    delayedStartTimer = setTimeout(() => {
+      delayedStartTimer = null;
+      delayedStartUntilMs = null;
+      if (!desiredConfig?.stream) {
+        return;
       }
-      restartTimer = setTimeout(() => {
-        restartTimer = null;
-        if (desiredConfig) {
-          startFfplay(desiredConfig).catch((error) => appendLog(`Failed to restart ffplay: ${String(error)}`));
-        }
-      }, 1000);
-    }
-  });
+
+      const expectedStreamId = String(config.stream?.id || "").trim();
+      const currentStreamId = String(desiredConfig.stream?.id || "").trim();
+      if (!expectedStreamId || expectedStreamId !== currentStreamId) {
+        appendLog("Skipping delayed ffplay start because assigned stream changed");
+        return;
+      }
+
+      if (!desiredConfig.clientSettings.playEnabled || desiredConfig.serverPauseEnabled) {
+        appendLog("Skipping delayed ffplay start because playback is currently disabled");
+        return;
+      }
+
+      spawnFfplayNow(desiredConfig);
+    }, requestedDelayMs);
+    return;
+  }
+
+  spawnFfplayNow(config);
+}
+
+async function startGstreamer(config: RuntimeConfig) {
+  if (config.serverPauseEnabled) {
+    const reason = config.serverPauseMessage || "Video server paused";
+    appendLog(`Server pause mode is enabled (${reason}), gstreamer remains stopped`);
+    killFfplay();
+    return;
+  }
+
+  if (!config.clientSettings.playEnabled) {
+    appendLog("Play is disabled by admin, gstreamer remains stopped");
+    killFfplay();
+    return;
+  }
+
+  if (!config.stream) {
+    appendLog("No stream assigned, gstreamer remains stopped");
+    killFfplay();
+    return;
+  }
+
+  if ((gstreamerPath.includes("\\") || gstreamerPath.includes("/")) && !existsSync(gstreamerPath)) {
+    appendLog(`Configured gstreamer executable was not found at ${gstreamerPath}; falling back to ffplay`);
+    await startFfplay({
+      ...config,
+      clientSettings: {
+        ...config.clientSettings,
+        playerBackend: "ffplay",
+      },
+    });
+    return;
+  }
+
+  killFfplay();
+  resetVideoTimestamp();
+
+  const requestedDelayMs = Math.max(0, Math.round(config.streamLatencyOffsetMs || 0));
+  if (requestedDelayMs > 0) {
+    appendLog(`Applying stream latency delay of ${requestedDelayMs}ms before gstreamer start`);
+    delayedStartUntilMs = Date.now() + requestedDelayMs;
+    delayedStartTimer = setTimeout(() => {
+      delayedStartTimer = null;
+      delayedStartUntilMs = null;
+      if (!desiredConfig?.stream) {
+        return;
+      }
+
+      const expectedStreamId = String(config.stream?.id || "").trim();
+      const currentStreamId = String(desiredConfig.stream?.id || "").trim();
+      if (!expectedStreamId || expectedStreamId !== currentStreamId) {
+        appendLog("Skipping delayed gstreamer start because assigned stream changed");
+        return;
+      }
+
+      if (!desiredConfig.clientSettings.playEnabled || desiredConfig.serverPauseEnabled) {
+        appendLog("Skipping delayed gstreamer start because playback is currently disabled");
+        return;
+      }
+
+      try {
+        spawnGstreamerNow(desiredConfig);
+      } catch (error) {
+        appendLog(`Failed to spawn gstreamer (${String(error)}); falling back to ffplay`);
+        startFfplay({
+          ...desiredConfig,
+          clientSettings: {
+            ...desiredConfig.clientSettings,
+            playerBackend: "ffplay",
+          },
+        }).catch((innerError) => appendLog(`Fallback ffplay start failed: ${String(innerError)}`));
+      }
+    }, requestedDelayMs);
+    return;
+  }
+
+  try {
+    spawnGstreamerNow(config);
+  } catch (error) {
+    appendLog(`Failed to spawn gstreamer (${String(error)}); falling back to ffplay`);
+    await startFfplay({
+      ...config,
+      clientSettings: {
+        ...config.clientSettings,
+        playerBackend: "ffplay",
+      },
+    });
+  }
+}
+
+async function startPlayback(config: RuntimeConfig) {
+  if (config.clientSettings.playerBackend === "gstreamer") {
+    await startGstreamer(config);
+    return;
+  }
+
+  await startFfplay(config);
 }
 
 function applyConfig(config: RuntimeConfig) {
@@ -1013,7 +1306,7 @@ function applyConfig(config: RuntimeConfig) {
 
   desiredConfig = normalized;
   saveLastConfig(normalized);
-  startFfplay(normalized).catch((error) => appendLog(`Failed to start ffplay: ${String(error)}`));
+  startPlayback(normalized).catch((error) => appendLog(`Failed to start playback: ${String(error)}`));
   publishHealth();
 }
 
@@ -1089,6 +1382,21 @@ async function connect() {
 
       if (action === "restart") {
         requestSupervisorAction("restart");
+        return;
+      }
+
+      if (action === "sync_nudge") {
+        applyLiveSyncNudge(msg.payload?.deltaMs)
+          .then((handled) => {
+            if (!handled) {
+              appendLog("sync_nudge could not be applied live; using restart fallback");
+              requestSupervisorAction("restart");
+            }
+          })
+          .catch((error) => {
+            appendLog(`sync_nudge failed: ${String(error)}; using restart fallback`);
+            requestSupervisorAction("restart");
+          });
         return;
       }
 
