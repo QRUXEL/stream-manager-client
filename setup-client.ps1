@@ -103,6 +103,21 @@ function Get-GstreamerCommand {
   return (Get-Command gst-launch-1.0 -ErrorAction SilentlyContinue)
 }
 
+function Add-ToPathIfMissing([string]$PathEntry) {
+  if ([string]::IsNullOrWhiteSpace($PathEntry)) {
+    return
+  }
+
+  if (-not (Test-Path -Path $PathEntry)) {
+    return
+  }
+
+  $pathEntries = $env:Path -split ';'
+  if ($pathEntries -notcontains $PathEntry) {
+    $env:Path = "$PathEntry;$env:Path"
+  }
+}
+
 function Find-GstreamerExecutableFromCommonPaths {
   $pathCandidates = @()
   $roots = @(
@@ -136,12 +151,7 @@ function Find-GstreamerExecutableFromCommonPaths {
   foreach ($candidate in $pathCandidates) {
     if (Test-Path -Path $candidate) {
       $binDir = Split-Path -Path $candidate -Parent
-      if (-not [string]::IsNullOrWhiteSpace($binDir)) {
-        $pathEntries = $env:Path -split ';'
-        if ($pathEntries -notcontains $binDir) {
-          $env:Path = "$binDir;$env:Path"
-        }
-      }
+      Add-ToPathIfMissing -PathEntry $binDir
 
       return $candidate
     }
@@ -198,10 +208,75 @@ function Find-GstreamerExecutableWithRecursiveSearch {
   return $null
 }
 
-function Resolve-GstreamerExecutablePath {
+function Find-GstreamerInstallRootsFromRegistry {
+  $roots = @()
+  $registryPaths = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+  )
+
+  foreach ($registryPath in $registryPaths) {
+    $items = Get-ItemProperty -Path $registryPath -ErrorAction SilentlyContinue
+    foreach ($item in $items) {
+      $displayName = [string]$item.DisplayName
+      if ([string]::IsNullOrWhiteSpace($displayName) -or $displayName -notmatch 'GStreamer') {
+        continue
+      }
+
+      foreach ($propertyName in @('InstallLocation', 'InstallSource')) {
+        $value = [string]$item.$propertyName
+        if (-not [string]::IsNullOrWhiteSpace($value) -and (Test-Path -Path $value)) {
+          $roots += $value
+        }
+      }
+    }
+  }
+
+  if ($roots.Count -eq 0) {
+    return @()
+  }
+
+  return ($roots | Select-Object -Unique)
+}
+
+function Find-GstreamerExecutableFromRegistry {
+  $installRoots = Find-GstreamerInstallRootsFromRegistry
+  if ($installRoots.Count -eq 0) {
+    return $null
+  }
+
+  $relativeCandidates = @(
+    'bin\gst-play-1.0.exe',
+    'bin\gst-launch-1.0.exe',
+    'msvc_x86_64\bin\gst-play-1.0.exe',
+    'msvc_x86\bin\gst-play-1.0.exe',
+    'msvc_x86_64\bin\gst-launch-1.0.exe',
+    'msvc_x86\bin\gst-launch-1.0.exe',
+    '1.0\msvc_x86_64\bin\gst-play-1.0.exe',
+    '1.0\msvc_x86\bin\gst-play-1.0.exe',
+    '1.0\msvc_x86_64\bin\gst-launch-1.0.exe',
+    '1.0\msvc_x86\bin\gst-launch-1.0.exe'
+  )
+
+  foreach ($root in $installRoots) {
+    foreach ($relativeCandidate in $relativeCandidates) {
+      $candidate = Join-Path $root $relativeCandidate
+      if (Test-Path -Path $candidate) {
+        return $candidate
+      }
+    }
+  }
+
+  return $null
+}
+
+function Resolve-GstreamerExecutableCandidates {
+  $candidates = @()
+
   $fromWhere = Find-GstreamerExecutableWithWhere
   if ($fromWhere) {
-    return $fromWhere
+    $candidates += $fromWhere
   }
 
   $gstCommand = Get-GstreamerCommand
@@ -212,20 +287,58 @@ function Resolve-GstreamerExecutablePath {
     }
 
     if (-not [string]::IsNullOrWhiteSpace($source) -and (Test-Path -Path $source)) {
-      return $source
+      $candidates += $source
     }
   }
 
   $fromCommonPaths = Find-GstreamerExecutableFromCommonPaths
   if ($fromCommonPaths) {
-    return $fromCommonPaths
+    $candidates += $fromCommonPaths
   }
 
-  return Find-GstreamerExecutableWithRecursiveSearch
+  $fromRegistry = Find-GstreamerExecutableFromRegistry
+  if ($fromRegistry) {
+    $candidates += $fromRegistry
+  }
+
+  $fromRecursive = Find-GstreamerExecutableWithRecursiveSearch
+  if ($fromRecursive) {
+    $candidates += $fromRecursive
+  }
+
+  if ($candidates.Count -eq 0) {
+    return @()
+  }
+
+  return ($candidates | Select-Object -Unique)
+}
+
+function Get-RunnableGstreamerExecutable {
+  $candidates = Resolve-GstreamerExecutableCandidates
+  foreach ($candidate in $candidates) {
+    if ([string]::IsNullOrWhiteSpace($candidate) -or -not (Test-Path -Path $candidate)) {
+      continue
+    }
+
+    $binDir = Split-Path -Path $candidate -Parent
+    Add-ToPathIfMissing -PathEntry $binDir
+
+    try {
+      & $candidate --version *> $null
+      if ($LASTEXITCODE -eq 0) {
+        return $candidate
+      }
+    }
+    catch {
+      Write-Host "Discovered gstreamer candidate is not runnable: $candidate"
+    }
+  }
+
+  return $null
 }
 
 function Ensure-GstreamerInstalled {
-  $gstSource = Resolve-GstreamerExecutablePath
+  $gstSource = Get-RunnableGstreamerExecutable
   if (-not $gstSource) {
     Write-Host 'GStreamer not found. Installing with winget...'
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
@@ -261,7 +374,7 @@ function Ensure-GstreamerInstalled {
     }
 
     Refresh-ProcessPath
-    $gstSource = Resolve-GstreamerExecutablePath
+    $gstSource = Get-RunnableGstreamerExecutable
   }
 
   if (-not $gstSource) {
@@ -272,10 +385,7 @@ function Ensure-GstreamerInstalled {
     throw 'Unable to resolve GStreamer executable path after installation.'
   }
 
-  & $gstSource --version *> $null
-  if ($LASTEXITCODE -ne 0) {
-    throw 'GStreamer command was found but failed to execute.'
-  }
+  Write-Host "Using GStreamer executable: $gstSource"
 }
 
 function Update-ClientFromGitHub {
