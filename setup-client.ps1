@@ -108,6 +108,9 @@ function Find-GstreamerExecutableFromCommonPaths {
   $roots = @(
     $env:ProgramFiles,
     ${env:ProgramFiles(x86)},
+    $env:LOCALAPPDATA,
+    (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'),
+    (Join-Path $env:LOCALAPPDATA 'Programs'),
     'C:\gstreamer'
   )
 
@@ -147,7 +150,60 @@ function Find-GstreamerExecutableFromCommonPaths {
   return $null
 }
 
+function Find-GstreamerExecutableWithWhere {
+  $commands = @('gst-play-1.0.exe', 'gst-play-1.0', 'gst-launch-1.0.exe', 'gst-launch-1.0')
+  foreach ($commandName in $commands) {
+    $matches = (& where.exe $commandName 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $matches) {
+      continue
+    }
+
+    foreach ($match in $matches) {
+      $candidate = ($match | Out-String).Trim()
+      if ([string]::IsNullOrWhiteSpace($candidate)) {
+        continue
+      }
+
+      if (Test-Path -Path $candidate) {
+        return $candidate
+      }
+    }
+  }
+
+  return $null
+}
+
+function Find-GstreamerExecutableWithRecursiveSearch {
+  $roots = @(
+    $env:ProgramFiles,
+    ${env:ProgramFiles(x86)},
+    $env:LOCALAPPDATA,
+    'C:\gstreamer'
+  )
+
+  $targets = @('gst-play-1.0.exe', 'gst-launch-1.0.exe')
+  foreach ($root in $roots) {
+    if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -Path $root)) {
+      continue
+    }
+
+    foreach ($target in $targets) {
+      $match = Get-ChildItem -Path $root -Filter $target -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($match) {
+        return $match.FullName
+      }
+    }
+  }
+
+  return $null
+}
+
 function Resolve-GstreamerExecutablePath {
+  $fromWhere = Find-GstreamerExecutableWithWhere
+  if ($fromWhere) {
+    return $fromWhere
+  }
+
   $gstCommand = Get-GstreamerCommand
   if ($gstCommand) {
     $source = $gstCommand.Source
@@ -160,7 +216,12 @@ function Resolve-GstreamerExecutablePath {
     }
   }
 
-  return Find-GstreamerExecutableFromCommonPaths
+  $fromCommonPaths = Find-GstreamerExecutableFromCommonPaths
+  if ($fromCommonPaths) {
+    return $fromCommonPaths
+  }
+
+  return Find-GstreamerExecutableWithRecursiveSearch
 }
 
 function Ensure-GstreamerInstalled {
@@ -204,7 +265,7 @@ function Ensure-GstreamerInstalled {
   }
 
   if (-not $gstSource) {
-    throw 'GStreamer was not found after installation.'
+      throw 'GStreamer was not found after installation. Checked PATH, where.exe, common install folders, and recursive discovery roots.'
   }
 
   if ([string]::IsNullOrWhiteSpace($gstSource) -or -not (Test-Path -Path $gstSource)) {
