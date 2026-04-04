@@ -103,9 +103,69 @@ function Get-GstreamerCommand {
   return (Get-Command gst-launch-1.0 -ErrorAction SilentlyContinue)
 }
 
-function Ensure-GstreamerInstalled {
+function Find-GstreamerExecutableFromCommonPaths {
+  $pathCandidates = @()
+  $roots = @(
+    $env:ProgramFiles,
+    ${env:ProgramFiles(x86)},
+    'C:\gstreamer'
+  )
+
+  foreach ($root in $roots) {
+    if ([string]::IsNullOrWhiteSpace($root)) {
+      continue
+    }
+
+    $pathCandidates += (Join-Path $root 'GStreamer\1.0\msvc_x86_64\bin\gst-play-1.0.exe')
+    $pathCandidates += (Join-Path $root 'GStreamer\1.0\msvc_x86\bin\gst-play-1.0.exe')
+    $pathCandidates += (Join-Path $root 'GStreamer\1.0\msvc_x86_64\bin\gst-launch-1.0.exe')
+    $pathCandidates += (Join-Path $root 'GStreamer\1.0\msvc_x86\bin\gst-launch-1.0.exe')
+    $pathCandidates += (Join-Path $root 'gstreamer\1.0\msvc_x86_64\bin\gst-play-1.0.exe')
+    $pathCandidates += (Join-Path $root 'gstreamer\1.0\msvc_x86\bin\gst-play-1.0.exe')
+    $pathCandidates += (Join-Path $root 'gstreamer\1.0\msvc_x86_64\bin\gst-launch-1.0.exe')
+    $pathCandidates += (Join-Path $root 'gstreamer\1.0\msvc_x86\bin\gst-launch-1.0.exe')
+    $pathCandidates += (Join-Path $root '1.0\msvc_x86_64\bin\gst-play-1.0.exe')
+    $pathCandidates += (Join-Path $root '1.0\msvc_x86\bin\gst-play-1.0.exe')
+    $pathCandidates += (Join-Path $root '1.0\msvc_x86_64\bin\gst-launch-1.0.exe')
+    $pathCandidates += (Join-Path $root '1.0\msvc_x86\bin\gst-launch-1.0.exe')
+  }
+
+  foreach ($candidate in $pathCandidates) {
+    if (Test-Path -Path $candidate) {
+      $binDir = Split-Path -Path $candidate -Parent
+      if (-not [string]::IsNullOrWhiteSpace($binDir)) {
+        $pathEntries = $env:Path -split ';'
+        if ($pathEntries -notcontains $binDir) {
+          $env:Path = "$binDir;$env:Path"
+        }
+      }
+
+      return $candidate
+    }
+  }
+
+  return $null
+}
+
+function Resolve-GstreamerExecutablePath {
   $gstCommand = Get-GstreamerCommand
-  if (-not $gstCommand) {
+  if ($gstCommand) {
+    $source = $gstCommand.Source
+    if ([string]::IsNullOrWhiteSpace($source) -and $gstCommand.PSObject.Properties['Path']) {
+      $source = $gstCommand.Path
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($source) -and (Test-Path -Path $source)) {
+      return $source
+    }
+  }
+
+  return Find-GstreamerExecutableFromCommonPaths
+}
+
+function Ensure-GstreamerInstalled {
+  $gstSource = Resolve-GstreamerExecutablePath
+  if (-not $gstSource) {
     Write-Host 'GStreamer not found. Installing with winget...'
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
       throw 'winget is not available; cannot auto-install GStreamer.'
@@ -124,27 +184,27 @@ function Ensure-GstreamerInstalled {
         $installed = $true
         break
       }
+
+      Write-Host "winget did not install/update package ID $packageId. Trying next option..."
     }
 
     if (-not $installed) {
       Write-Host 'GStreamer install by package ID failed. Trying name-based install...'
       winget install --name GStreamer -e --source winget --accept-package-agreements --accept-source-agreements
-      if ($LASTEXITCODE -ne 0) {
-        throw 'GStreamer installation via winget failed.'
+      if ($LASTEXITCODE -eq 0) {
+        $installed = $true
+      }
+      else {
+        Write-Host 'winget name-based install did not apply an install/update. Continuing with binary discovery...'
       }
     }
 
     Refresh-ProcessPath
-    $gstCommand = Get-GstreamerCommand
+    $gstSource = Resolve-GstreamerExecutablePath
   }
 
-  if (-not $gstCommand) {
+  if (-not $gstSource) {
     throw 'GStreamer was not found after installation.'
-  }
-
-  $gstSource = $gstCommand.Source
-  if ([string]::IsNullOrWhiteSpace($gstSource) -and $gstCommand.PSObject.Properties['Path']) {
-    $gstSource = $gstCommand.Path
   }
 
   if ([string]::IsNullOrWhiteSpace($gstSource) -or -not (Test-Path -Path $gstSource)) {
