@@ -1,5 +1,6 @@
 import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createSocket } from "node:dgram";
+import { createConnection } from "node:net";
 import { join } from "node:path";
 
 type StreamConfig = {
@@ -118,6 +119,12 @@ let bufferHeadroomMs: number | null = null;
 let shuttingDown = false;
 let gstreamerHelpTextCache: string | null = null;
 const gstreamerExecutableAvailabilityCache = new Map<string, boolean>();
+let mpvIpcPipePath: string | null = null;
+let mpvPreviewDataUrl: string | null = null;
+let mpvPreviewCapturedAt: string | null = null;
+let mpvPreviewCaptureInFlight = false;
+let lastMpvPreviewCaptureMs = 0;
+const mpvPreviewCaptureIntervalMs = 4000;
 
 function clearDelayedStartTimer() {
   if (delayedStartTimer) {
@@ -142,6 +149,113 @@ function resetVideoTimestamp() {
   videoTimestampUpdatedAt = null;
   bufferWindowMs = null;
   bufferHeadroomMs = null;
+  mpvPreviewDataUrl = null;
+  mpvPreviewCapturedAt = null;
+}
+
+function sendMpvIpcCommand(command: unknown[]) {
+  return new Promise<boolean>((resolve) => {
+    const pipePath = mpvIpcPipePath;
+    if (!pipePath) {
+      resolve(false);
+      return;
+    }
+
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (!settled) {
+        settled = true;
+        resolve(ok);
+      }
+    };
+
+    try {
+      const socket = createConnection(pipePath);
+      socket.setTimeout(1500, () => {
+        try {
+          socket.destroy();
+        } catch {
+        }
+        finish(false);
+      });
+
+      socket.on("error", () => {
+        finish(false);
+      });
+
+      socket.on("connect", () => {
+        try {
+          const payload = JSON.stringify({ command }) + "\n";
+          socket.write(payload, () => {
+            try {
+              socket.end();
+            } catch {
+            }
+            finish(true);
+          });
+        } catch {
+          finish(false);
+        }
+      });
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+async function maybeCaptureMpvPreview() {
+  if (!desiredConfig || desiredConfig.clientSettings.playerBackend !== "mpv" || !activeProcess) {
+    return;
+  }
+
+  if (!mpvIpcPipePath || mpvPreviewCaptureInFlight) {
+    return;
+  }
+
+  const now = Date.now();
+  if (now - lastMpvPreviewCaptureMs < mpvPreviewCaptureIntervalMs) {
+    return;
+  }
+
+  mpvPreviewCaptureInFlight = true;
+  lastMpvPreviewCaptureMs = now;
+
+  const tmpPath = join(clientDir, `mpv-preview-${clientId}.jpg`);
+  try {
+    if (existsSync(tmpPath)) {
+      try {
+        unlinkSync(tmpPath);
+      } catch {
+      }
+    }
+
+    const sent = await sendMpvIpcCommand(["screenshot-to-file", tmpPath, "video"]);
+    if (!sent) {
+      return;
+    }
+
+    if (!existsSync(tmpPath)) {
+      return;
+    }
+
+    const bytes = readFileSync(tmpPath);
+    if (!bytes || bytes.length === 0) {
+      return;
+    }
+
+    mpvPreviewDataUrl = `data:image/jpeg;base64,${Buffer.from(bytes).toString("base64")}`;
+    mpvPreviewCapturedAt = new Date().toISOString();
+  } catch (error) {
+    appendLog(`mpv preview capture failed: ${String(error)}`);
+  } finally {
+    try {
+      if (existsSync(tmpPath)) {
+        unlinkSync(tmpPath);
+      }
+    } catch {
+    }
+    mpvPreviewCaptureInFlight = false;
+  }
 }
 
 async function writeToActivePlayerStdin(input: string) {
@@ -860,6 +974,8 @@ function publishHealth() {
   bufferWindowMs = nextBufferWindowMs;
   bufferHeadroomMs = nextBufferHeadroomMs;
 
+  maybeCaptureMpvPreview().catch((error) => appendLog(`mpv preview task failed: ${String(error)}`));
+
   send("client_health", {
     uptimeSec: Math.floor(process.uptime()),
     memoryRss: process.memoryUsage().rss,
@@ -878,6 +994,8 @@ function publishHealth() {
     appliedLatencyOffsetMs,
     bufferWindowMs: nextBufferWindowMs,
     bufferHeadroomMs: nextBufferHeadroomMs,
+    playerPreviewImageDataUrl: mpvPreviewDataUrl,
+    playerPreviewCapturedAt: mpvPreviewCapturedAt,
   });
 }
 
@@ -1416,7 +1534,10 @@ function buildMpvArgs(config: RuntimeConfig) {
 }
 
 function spawnMpvNow(config: RuntimeConfig) {
+  const nextPipePath = `\\\\.\\pipe\\stream-manager-mpv-${clientId}-${Date.now()}`;
   const args = buildMpvArgs(config);
+  args.unshift(`--input-ipc-server=${nextPipePath}`);
+  args.unshift("--screenshot-format=jpg", "--screenshot-jpeg-quality=72");
   currentCommandLine = buildCommandLine(mpvPath, args);
   appendLog(`Starting mpv: ${mpvPath} ${args.join(" ")}`);
 
@@ -1430,6 +1551,7 @@ function spawnMpvNow(config: RuntimeConfig) {
   });
 
   activeProcess = processRef;
+  mpvIpcPipePath = nextPipePath;
   appliedLatencyOffsetMs = Math.max(0, Math.round(config.streamLatencyOffsetMs || 0));
   lastRestartAt = new Date().toISOString();
 
@@ -1444,6 +1566,7 @@ function spawnMpvNow(config: RuntimeConfig) {
     }
 
     activeProcess = null;
+    mpvIpcPipePath = null;
     appliedLatencyOffsetMs = 0;
     resetVideoTimestamp();
     if (desiredConfig?.stream && desiredConfig.clientSettings.playEnabled && !desiredConfig.serverPauseEnabled) {
