@@ -431,6 +431,70 @@ async function applyLiveSyncNudge(deltaMsRaw: unknown) {
   return true;
 }
 
+async function togglePlayerPause() {
+  if (!desiredConfig || !activeProcess) {
+    return false;
+  }
+
+  if (desiredConfig.clientSettings.playerBackend === "mpv") {
+    const result = await sendMpvIpcCommand(["cycle", "pause"], true);
+    if (!result.ok) {
+      appendLog(`Failed to toggle mpv pause: ${result.error || "unknown error"}`);
+      return false;
+    }
+    appendLog("Toggled mpv pause state");
+    return true;
+  }
+
+  if (desiredConfig.clientSettings.playerBackend === "gstreamer") {
+    const ok = await writeToActivePlayerStdin(" ");
+    if (!ok) {
+      appendLog("Failed to toggle gstreamer pause state");
+      return false;
+    }
+    appendLog("Toggled gstreamer pause state");
+    return true;
+  }
+
+  appendLog("Pause toggle is not supported for ffplay in current client runtime");
+  return false;
+}
+
+async function jumpPlayerToLiveEnd() {
+  if (!desiredConfig || !activeProcess) {
+    return false;
+  }
+
+  if (desiredConfig.clientSettings.playerBackend === "mpv") {
+    const unpause = await sendMpvIpcCommand(["set_property", "pause", false], true);
+    if (!unpause.ok) {
+      appendLog(`Failed to clear mpv pause before jump-live: ${unpause.error || "unknown error"}`);
+    }
+
+    const seek = await sendMpvIpcCommand(["seek", 100, "absolute-percent"], true);
+    if (!seek.ok) {
+      appendLog(`Failed to jump mpv to live/end: ${seek.error || "unknown error"}`);
+      return false;
+    }
+
+    appendLog("Jumped mpv playback toward live/end");
+    return true;
+  }
+
+  if (!desiredConfig.stream) {
+    return false;
+  }
+
+  appendLog(`Jump-live requested for ${desiredConfig.clientSettings.playerBackend}; restarting playback as fallback`);
+  try {
+    await startPlayback(desiredConfig);
+    return true;
+  } catch (error) {
+    appendLog(`Jump-live fallback restart failed: ${String(error)}`);
+    return false;
+  }
+}
+
 function extractVideoTimestampFromFfplayLine(lineRaw: string) {
   const line = String(lineRaw || "").trim();
   if (!line) {
@@ -1103,6 +1167,12 @@ function publishHealth() {
 
   bufferWindowMs = nextBufferWindowMs;
   bufferHeadroomMs = nextBufferHeadroomMs;
+
+  if (desiredConfig?.clientSettings.playerBackend === "mpv" && activeProcess && !mpvIpcPipePath) {
+    mpvIpcHealthy = false;
+    mpvIpcLastCheckedAt = new Date().toISOString();
+    mpvIpcLastError = "mpv process is running but IPC pipe is unavailable";
+  }
 
   maybeProbeMpvIpcHealth().catch((error) => appendLog(`mpv IPC probe failed: ${String(error)}`));
   maybeCaptureMpvPreview().catch((error) => appendLog(`mpv preview task failed: ${String(error)}`));
@@ -2077,6 +2147,9 @@ async function startMpv(config: RuntimeConfig) {
 
   if (!canRunMpvExecutable()) {
     appendLog(`Configured mpv executable was not found or not runnable at ${mpvPath}; falling back to ffplay`);
+    mpvIpcHealthy = false;
+    mpvIpcLastCheckedAt = new Date().toISOString();
+    mpvIpcLastError = `mpv executable is not runnable at ${mpvPath}`;
     await startFfplay({
       ...config,
       clientSettings: {
@@ -2117,6 +2190,9 @@ async function startMpv(config: RuntimeConfig) {
         spawnMpvNow(desiredConfig);
       } catch (error) {
         appendLog(`Failed to spawn mpv (${String(error)}); falling back to ffplay`);
+        mpvIpcHealthy = false;
+        mpvIpcLastCheckedAt = new Date().toISOString();
+        mpvIpcLastError = `mpv launch failed: ${String(error)}`;
         startFfplay({
           ...desiredConfig,
           clientSettings: {
@@ -2133,6 +2209,9 @@ async function startMpv(config: RuntimeConfig) {
     spawnMpvNow(config);
   } catch (error) {
     appendLog(`Failed to spawn mpv (${String(error)}); falling back to ffplay`);
+    mpvIpcHealthy = false;
+    mpvIpcLastCheckedAt = new Date().toISOString();
+    mpvIpcLastError = `mpv launch failed: ${String(error)}`;
     await startFfplay({
       ...config,
       clientSettings: {
@@ -2257,6 +2336,28 @@ async function connect() {
             appendLog(`sync_nudge failed: ${String(error)}; using restart fallback`);
             requestSupervisorAction("restart");
           });
+        return;
+      }
+
+      if (action === "toggle_pause") {
+        togglePlayerPause()
+          .then((handled) => {
+            if (!handled) {
+              appendLog("toggle_pause could not be applied for current backend/state");
+            }
+          })
+          .catch((error) => appendLog(`toggle_pause failed: ${String(error)}`));
+        return;
+      }
+
+      if (action === "jump_live") {
+        jumpPlayerToLiveEnd()
+          .then((handled) => {
+            if (!handled) {
+              appendLog("jump_live could not be applied for current backend/state");
+            }
+          })
+          .catch((error) => appendLog(`jump_live failed: ${String(error)}`));
         return;
       }
 
