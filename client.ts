@@ -52,7 +52,7 @@ type ClientSettings = {
   fastDecode: boolean;
   genPts: boolean;
   extraArgs: string;
-  playerBackend: "ffplay" | "gstreamer";
+  playerBackend: "ffplay" | "gstreamer" | "mpv";
 };
 
 type RuntimeConfig = {
@@ -72,6 +72,7 @@ const ffplayPath = join(clientDir, "ffplay.exe");
 const gstreamerPath = String(Bun.env.GSTREAMER_PATH || "").trim() || "gst-play-1.0";
 const gstreamerLaunchPath = String(Bun.env.GSTREAMER_LAUNCH_PATH || "").trim() || "gst-launch-1.0";
 const gstreamerPlayerMode = String(Bun.env.GSTREAMER_PLAYER_MODE || "auto").trim().toLowerCase();
+const mpvPath = String(Bun.env.MPV_PATH || "").trim() || "mpv.exe";
 const persistedConfigPath = "./last-config.json";
 const lockFilePath = "./client.lock";
 const overlayAppDir = join(clientDir, "electron-overlay");
@@ -714,7 +715,16 @@ function normalizeRuntimeConfig(raw: unknown): RuntimeConfig | null {
       fastDecode: Boolean(clientRaw.fastDecode),
       genPts: Boolean(clientRaw.genPts),
       extraArgs: String(clientRaw.extraArgs ?? ""),
-      playerBackend: String(clientRaw.playerBackend || "ffplay").trim().toLowerCase() === "gstreamer" ? "gstreamer" : "ffplay",
+      playerBackend: (() => {
+        const backend = String(clientRaw.playerBackend || "ffplay").trim().toLowerCase();
+        if (backend === "gstreamer") {
+          return "gstreamer";
+        }
+        if (backend === "mpv") {
+          return "mpv";
+        }
+        return "ffplay";
+      })(),
     },
     streamLatencyOffsetMs,
     serverPauseEnabled,
@@ -1334,6 +1344,123 @@ function buildFfplayArgs(config: RuntimeConfig) {
   return args;
 }
 
+function canRunMpvExecutable() {
+  const normalized = String(mpvPath || "").trim();
+  if (!normalized) {
+    return false;
+  }
+
+  if ((normalized.includes("\\") || normalized.includes("/")) && !existsSync(normalized)) {
+    return false;
+  }
+
+  try {
+    const probe = Bun.spawnSync([normalized, "--version"], {
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    return probe.exitCode === 0;
+  } catch {
+    return false;
+  }
+}
+
+function buildMpvArgs(config: RuntimeConfig) {
+  const args: string[] = [
+    "--force-window=yes",
+    "--no-border",
+    "--keep-open=no",
+    "--input-default-bindings=no",
+  ];
+
+  if (config.globalFfplaySettings.fullScreen.enabled && config.globalFfplaySettings.fullScreen.value) {
+    args.push("--fullscreen");
+  }
+
+  if (config.globalFfplaySettings.alwaysOnTop.enabled && config.globalFfplaySettings.alwaysOnTop.value) {
+    args.push("--ontop");
+  }
+
+  if (config.globalFfplaySettings.mute.enabled && config.globalFfplaySettings.mute.value) {
+    args.push("--mute=yes");
+  }
+
+  if (config.globalFfplaySettings.volume.enabled) {
+    const volumePercent = Math.max(0, Math.min(200, Math.round(config.globalFfplaySettings.volume.value ?? 100)));
+    args.push(`--volume=${volumePercent}`);
+  }
+
+  const windowX = Number.isFinite(config.clientSettings.windowX) ? Math.floor(config.clientSettings.windowX) : 0;
+  const windowY = Number.isFinite(config.clientSettings.windowY) ? Math.floor(config.clientSettings.windowY) : 0;
+  args.push(`--geometry=${Math.max(0, windowX)}:${Math.max(0, windowY)}`);
+
+  if (config.clientSettings.fastDecode) {
+    args.push("--vd-lavc-fast");
+  }
+
+  if (config.globalFfplaySettings.lowLatency.enabled && config.globalFfplaySettings.lowLatency.value) {
+    args.push("--profile=low-latency");
+  }
+
+  if (config.stream?.extraArgs) {
+    args.push(...splitArgs(config.stream.extraArgs));
+  }
+
+  if (config.clientSettings.extraArgs) {
+    args.push(...splitArgs(config.clientSettings.extraArgs));
+  }
+
+  args.push(config.stream?.url ?? "");
+  return args;
+}
+
+function spawnMpvNow(config: RuntimeConfig) {
+  const args = buildMpvArgs(config);
+  currentCommandLine = buildCommandLine(mpvPath, args);
+  appendLog(`Starting mpv: ${mpvPath} ${args.join(" ")}`);
+
+  const processRef = Bun.spawn([mpvPath, ...args], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    onExit(_, exitCode, signalCode, error) {
+      appendLog(`mpv exited (code=${exitCode}, signal=${signalCode}, error=${String(error || "none")})`);
+    },
+  });
+
+  activeProcess = processRef;
+  appliedLatencyOffsetMs = Math.max(0, Math.round(config.streamLatencyOffsetMs || 0));
+  lastRestartAt = new Date().toISOString();
+
+  pipeStreamToLogs(processRef.stdout, "mpv-stdout", appendLog, updateVideoTimestampFromFfplayLine)
+    .catch((error) => appendLog(`mpv stdout pipe error: ${String(error)}`));
+  pipeStreamToLogs(processRef.stderr, "mpv-stderr", appendLog, updateVideoTimestampFromFfplayLine)
+    .catch((error) => appendLog(`mpv stderr pipe error: ${String(error)}`));
+
+  processRef.exited.then(() => {
+    if (activeProcess !== processRef) {
+      return;
+    }
+
+    activeProcess = null;
+    appliedLatencyOffsetMs = 0;
+    resetVideoTimestamp();
+    if (desiredConfig?.stream && desiredConfig.clientSettings.playEnabled && !desiredConfig.serverPauseEnabled) {
+      appendLog("mpv stopped unexpectedly; scheduling restart");
+      if (restartTimer) {
+        clearTimeout(restartTimer);
+      }
+      restartTimer = setTimeout(() => {
+        restartTimer = null;
+        if (desiredConfig) {
+          startPlayback(desiredConfig).catch((error) => appendLog(`Failed to restart playback: ${String(error)}`));
+        }
+      }, 1000);
+    }
+  });
+}
+
 async function startFfplay(config: RuntimeConfig) {
   if (config.serverPauseEnabled) {
     const reason = config.serverPauseMessage || "Video server paused";
@@ -1414,8 +1541,9 @@ async function startGstreamer(config: RuntimeConfig) {
     return;
   }
 
-  if ((gstreamerPath.includes("\\") || gstreamerPath.includes("/")) && !existsSync(gstreamerPath)) {
-    appendLog(`Configured gstreamer executable was not found at ${gstreamerPath}; falling back to ffplay`);
+  const hasPlayableGstreamer = canRunGstreamerExecutable(gstreamerPath) || canRunGstreamerExecutable(gstreamerLaunchPath);
+  if (!hasPlayableGstreamer) {
+    appendLog(`No runnable gstreamer executable found (tried ${gstreamerPath} and ${gstreamerLaunchPath}); falling back to ffplay`);
     await startFfplay({
       ...config,
       clientSettings: {
@@ -1482,7 +1610,100 @@ async function startGstreamer(config: RuntimeConfig) {
   }
 }
 
+async function startMpv(config: RuntimeConfig) {
+  if (config.serverPauseEnabled) {
+    const reason = config.serverPauseMessage || "Video server paused";
+    appendLog(`Server pause mode is enabled (${reason}), mpv remains stopped`);
+    killFfplay();
+    return;
+  }
+
+  if (!config.clientSettings.playEnabled) {
+    appendLog("Play is disabled by admin, mpv remains stopped");
+    killFfplay();
+    return;
+  }
+
+  if (!config.stream) {
+    appendLog("No stream assigned, mpv remains stopped");
+    killFfplay();
+    return;
+  }
+
+  if (!canRunMpvExecutable()) {
+    appendLog(`Configured mpv executable was not found or not runnable at ${mpvPath}; falling back to ffplay`);
+    await startFfplay({
+      ...config,
+      clientSettings: {
+        ...config.clientSettings,
+        playerBackend: "ffplay",
+      },
+    });
+    return;
+  }
+
+  killFfplay();
+  resetVideoTimestamp();
+
+  const requestedDelayMs = Math.max(0, Math.round(config.streamLatencyOffsetMs || 0));
+  if (requestedDelayMs > 0) {
+    appendLog(`Applying stream latency delay of ${requestedDelayMs}ms before mpv start`);
+    delayedStartUntilMs = Date.now() + requestedDelayMs;
+    delayedStartTimer = setTimeout(() => {
+      delayedStartTimer = null;
+      delayedStartUntilMs = null;
+      if (!desiredConfig?.stream) {
+        return;
+      }
+
+      const expectedStreamId = String(config.stream?.id || "").trim();
+      const currentStreamId = String(desiredConfig.stream?.id || "").trim();
+      if (!expectedStreamId || expectedStreamId !== currentStreamId) {
+        appendLog("Skipping delayed mpv start because assigned stream changed");
+        return;
+      }
+
+      if (!desiredConfig.clientSettings.playEnabled || desiredConfig.serverPauseEnabled) {
+        appendLog("Skipping delayed mpv start because playback is currently disabled");
+        return;
+      }
+
+      try {
+        spawnMpvNow(desiredConfig);
+      } catch (error) {
+        appendLog(`Failed to spawn mpv (${String(error)}); falling back to ffplay`);
+        startFfplay({
+          ...desiredConfig,
+          clientSettings: {
+            ...desiredConfig.clientSettings,
+            playerBackend: "ffplay",
+          },
+        }).catch((innerError) => appendLog(`Fallback ffplay start failed: ${String(innerError)}`));
+      }
+    }, requestedDelayMs);
+    return;
+  }
+
+  try {
+    spawnMpvNow(config);
+  } catch (error) {
+    appendLog(`Failed to spawn mpv (${String(error)}); falling back to ffplay`);
+    await startFfplay({
+      ...config,
+      clientSettings: {
+        ...config.clientSettings,
+        playerBackend: "ffplay",
+      },
+    });
+  }
+}
+
 async function startPlayback(config: RuntimeConfig) {
+  if (config.clientSettings.playerBackend === "mpv") {
+    await startMpv(config);
+    return;
+  }
+
   if (config.clientSettings.playerBackend === "gstreamer") {
     await startGstreamer(config);
     return;

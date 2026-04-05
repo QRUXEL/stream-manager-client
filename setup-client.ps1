@@ -389,6 +389,73 @@ function Ensure-GstreamerInstalled {
   Write-Host "Using GStreamer executable: $gstSource"
 }
 
+function Get-MpvCommand {
+  $mpv = Get-Command mpv.exe -ErrorAction SilentlyContinue
+  if ($mpv) {
+    return $mpv
+  }
+
+  return (Get-Command mpv -ErrorAction SilentlyContinue)
+}
+
+function Ensure-MpvInstalled {
+  $mpvCommand = Get-MpvCommand
+  if (-not $mpvCommand) {
+    Write-Host 'mpv not found. Installing with winget...'
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+      throw 'winget is not available; cannot auto-install mpv.'
+    }
+
+    $packageIds = @(
+      'shinchiro.mpv',
+      'MPV.MPV',
+      'mpv.net'
+    )
+
+    $installed = $false
+    foreach ($packageId in $packageIds) {
+      winget install --id $packageId -e --source winget --accept-package-agreements --accept-source-agreements
+      if ($LASTEXITCODE -eq 0) {
+        $installed = $true
+        break
+      }
+
+      Write-Host "winget did not install/update package ID $packageId. Trying next option..."
+    }
+
+    if (-not $installed) {
+      Write-Host 'mpv install by package ID failed. Trying name-based install...'
+      winget install --name mpv -e --source winget --accept-package-agreements --accept-source-agreements
+      if ($LASTEXITCODE -ne 0) {
+        throw 'mpv installation via winget failed.'
+      }
+    }
+
+    Refresh-ProcessPath
+    $mpvCommand = Get-MpvCommand
+  }
+
+  if (-not $mpvCommand) {
+    throw 'mpv was not found after installation.'
+  }
+
+  $mpvSource = $mpvCommand.Source
+  if ([string]::IsNullOrWhiteSpace($mpvSource) -and $mpvCommand.PSObject.Properties['Path']) {
+    $mpvSource = $mpvCommand.Path
+  }
+
+  if ([string]::IsNullOrWhiteSpace($mpvSource) -or -not (Test-Path -Path $mpvSource)) {
+    throw 'Unable to resolve mpv executable path after installation.'
+  }
+
+  & $mpvSource --version *> $null
+  if ($LASTEXITCODE -ne 0) {
+    throw 'mpv command was found but failed to execute.'
+  }
+
+  Write-Host "Using mpv executable: $mpvSource"
+}
+
 function Update-ClientFromGitHub {
   $repoRoot = (& git rev-parse --show-toplevel 2>$null)
   if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) {
@@ -469,6 +536,7 @@ Ensure-GitInstalled
 Update-ClientFromGitHub
 Ensure-FfplayInstalled
 Ensure-GstreamerInstalled
+Ensure-MpvInstalled
 
 if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
   Write-Host 'Installing Bun...'
