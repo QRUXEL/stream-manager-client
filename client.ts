@@ -154,19 +154,27 @@ function resetVideoTimestamp() {
   mpvPreviewCapturedAt = null;
 }
 
-function sendMpvIpcCommand(command: unknown[]) {
-  return new Promise<boolean>((resolve) => {
+type MpvIpcResult = {
+  ok: boolean;
+  error?: string;
+};
+
+function sendMpvIpcCommand(command: unknown[], waitForReply = false) {
+  return new Promise<MpvIpcResult>((resolve) => {
     const pipePath = mpvIpcPipePath;
     if (!pipePath) {
-      resolve(false);
+      resolve({ ok: false, error: "mpv IPC pipe path is not set" });
       return;
     }
 
     let settled = false;
-    const finish = (ok: boolean) => {
+    let responseBuffer = "";
+    const requestId = Math.floor(Date.now() % 1_000_000_000);
+
+    const finish = (result: MpvIpcResult) => {
       if (!settled) {
         settled = true;
-        resolve(ok);
+        resolve(result);
       }
     };
 
@@ -177,29 +185,69 @@ function sendMpvIpcCommand(command: unknown[]) {
           socket.destroy();
         } catch {
         }
-        finish(false);
+        finish({ ok: false, error: "mpv IPC command timed out" });
       });
 
-      socket.on("error", () => {
-        finish(false);
+      socket.on("error", (error) => {
+        finish({ ok: false, error: `mpv IPC socket error: ${String(error)}` });
       });
 
-      socket.on("connect", () => {
+      socket.on("data", (chunk) => {
+        if (!waitForReply) {
+          return;
+        }
+
+        responseBuffer += chunk.toString();
+        const newlineIndex = responseBuffer.indexOf("\n");
+        if (newlineIndex < 0) {
+          return;
+        }
+
+        const line = responseBuffer.slice(0, newlineIndex).trim();
+        if (!line) {
+          return;
+        }
+
         try {
-          const payload = JSON.stringify({ command }) + "\n";
-          socket.write(payload, () => {
+          const parsed = JSON.parse(line) as { error?: string };
+          if (parsed.error && parsed.error !== "success") {
+            finish({ ok: false, error: `mpv IPC error response: ${parsed.error}` });
             try {
               socket.end();
             } catch {
             }
-            finish(true);
+            return;
+          }
+          finish({ ok: true });
+        } catch {
+          finish({ ok: false, error: `mpv IPC returned invalid JSON: ${line}` });
+        }
+
+        try {
+          socket.end();
+        } catch {
+        }
+      });
+
+      socket.on("connect", () => {
+        try {
+          const payload = JSON.stringify({ command, request_id: requestId }) + "\n";
+          socket.write(payload, () => {
+            if (waitForReply) {
+              return;
+            }
+            try {
+              socket.end();
+            } catch {
+            }
+            finish({ ok: true });
           });
         } catch {
-          finish(false);
+          finish({ ok: false, error: "failed to write mpv IPC payload" });
         }
       });
     } catch {
-      finish(false);
+      finish({ ok: false, error: "failed to connect to mpv IPC pipe" });
     }
   });
 }
@@ -230,12 +278,19 @@ async function maybeCaptureMpvPreview() {
       }
     }
 
-    const sent = await sendMpvIpcCommand(["screenshot-to-file", tmpPath, "video"]);
-    if (!sent) {
+    const sent = await sendMpvIpcCommand(["screenshot-to-file", tmpPath, "video"], true);
+    if (!sent.ok) {
+      appendLog(`mpv preview capture command failed: ${sent.error || "unknown error"}`);
       return;
     }
 
+    const deadline = Date.now() + 1600;
+    while (!existsSync(tmpPath) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+
     if (!existsSync(tmpPath)) {
+      appendLog("mpv preview capture produced no file after command success");
       return;
     }
 
@@ -292,17 +347,18 @@ async function applyLiveSyncNudge(deltaMsRaw: unknown) {
 
   if (desiredConfig.clientSettings.playerBackend === "mpv") {
     if (deltaMs > 0) {
-      const paused = await sendMpvIpcCommand(["set_property", "pause", true]);
-      if (!paused) {
+      const paused = await sendMpvIpcCommand(["set_property", "pause", true], true);
+      if (!paused.ok) {
+        appendLog(`Failed to pause mpv for sync nudge: ${paused.error || "unknown error"}`);
         return false;
       }
 
       appendLog(`Applying live mpv sync nudge: +${deltaMs}ms pause`);
       setTimeout(() => {
-        sendMpvIpcCommand(["set_property", "pause", false])
-          .then((ok) => {
-            if (!ok) {
-              appendLog("Failed to resume mpv after sync nudge");
+        sendMpvIpcCommand(["set_property", "pause", false], true)
+          .then((result) => {
+            if (!result.ok) {
+              appendLog(`Failed to resume mpv after sync nudge: ${result.error || "unknown error"}`);
             }
           })
           .catch((error) => appendLog(`Failed to resume mpv after sync nudge: ${String(error)}`));
@@ -311,8 +367,9 @@ async function applyLiveSyncNudge(deltaMsRaw: unknown) {
     }
 
     const seekSeconds = Math.abs(deltaMs) / 1000;
-    const seeked = await sendMpvIpcCommand(["seek", seekSeconds, "relative+exact"]);
-    if (!seeked) {
+    const seeked = await sendMpvIpcCommand(["seek", seekSeconds, "relative+exact"], true);
+    if (!seeked.ok) {
+      appendLog(`Failed to seek mpv for sync nudge: ${seeked.error || "unknown error"}`);
       return false;
     }
     appendLog(`Applying live mpv sync nudge: ${deltaMs}ms seek forward`);
@@ -1699,6 +1756,7 @@ function resolveMpvExecutablePath() {
 
 function buildMpvArgs(config: RuntimeConfig) {
   const args: string[] = [
+    "--osc=no",
     "--force-window=yes",
     "--no-border",
     "--keep-open=no",
