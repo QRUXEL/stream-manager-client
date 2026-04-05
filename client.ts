@@ -1,4 +1,4 @@
-import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createSocket } from "node:dgram";
 import { createConnection } from "node:net";
 import { join } from "node:path";
@@ -1527,6 +1527,53 @@ function resolveMpvExecutablePath() {
     return resolvedMpvExecutablePath;
   }
 
+  const findMpvInDirectory = (root: string, maxDepth = 4): string | null => {
+    const seen = new Set<string>();
+
+    const walk = (dir: string, depth: number): string | null => {
+      if (depth > maxDepth || seen.has(dir) || !existsSync(dir)) {
+        return null;
+      }
+      seen.add(dir);
+
+      let entries: string[] = [];
+      try {
+        entries = readdirSync(dir);
+      } catch {
+        return null;
+      }
+
+      for (const entry of entries) {
+        const full = join(dir, entry);
+        if (/^mpv(?:\.exe)?$/i.test(entry) && probeMpvExecutable(full)) {
+          return full;
+        }
+      }
+
+      for (const entry of entries) {
+        const full = join(dir, entry);
+        let isDirectory = false;
+        try {
+          isDirectory = statSync(full).isDirectory();
+        } catch {
+          isDirectory = false;
+        }
+        if (!isDirectory) {
+          continue;
+        }
+
+        const found = walk(full, depth + 1);
+        if (found) {
+          return found;
+        }
+      }
+
+      return null;
+    };
+
+    return walk(root, 0);
+  };
+
   const candidates = [
     String(Bun.env.MPV_PATH || "").trim(),
     String(mpvPath || "").trim(),
@@ -1539,7 +1586,30 @@ function resolveMpvExecutablePath() {
   for (const candidate of candidates) {
     if (probeMpvExecutable(candidate)) {
       resolvedMpvExecutablePath = candidate;
+      appendLog(`Resolved mpv executable: ${candidate}`);
       return candidate;
+    }
+  }
+
+  const searchRoots = [
+    String(Bun.env.LOCALAPPDATA || "").trim(),
+    String(Bun.env.ProgramFiles || "").trim(),
+    String((Bun.env as any)["ProgramFiles(x86)"] || "").trim(),
+  ].filter((item) => item.length > 0);
+
+  const wingetRoot = Bun.env.LOCALAPPDATA
+    ? join(String(Bun.env.LOCALAPPDATA), "Microsoft", "WinGet", "Packages")
+    : "";
+  if (wingetRoot) {
+    searchRoots.unshift(wingetRoot);
+  }
+
+  for (const root of searchRoots) {
+    const found = findMpvInDirectory(root, root === wingetRoot ? 5 : 3);
+    if (found) {
+      resolvedMpvExecutablePath = found;
+      appendLog(`Resolved mpv executable via filesystem scan: ${found}`);
+      return found;
     }
   }
 
@@ -1559,6 +1629,7 @@ function resolveMpvExecutablePath() {
       for (const line of lines) {
         if (probeMpvExecutable(line)) {
           resolvedMpvExecutablePath = line;
+          appendLog(`Resolved mpv executable via where: ${line}`);
           return line;
         }
       }
