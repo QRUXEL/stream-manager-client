@@ -280,12 +280,45 @@ async function writeToActivePlayerStdin(input: string) {
 }
 
 async function applyLiveSyncNudge(deltaMsRaw: unknown) {
-  const deltaMs = Math.max(0, Math.min(5000, Math.round(Number(deltaMsRaw) || 0)));
-  if (deltaMs <= 0) {
+  const deltaMs = Math.max(-5000, Math.min(5000, Math.round(Number(deltaMsRaw) || 0)));
+  if (deltaMs === 0) {
     return false;
   }
 
-  if (!desiredConfig || desiredConfig.clientSettings.playerBackend !== "gstreamer") {
+  if (!desiredConfig) {
+    return false;
+  }
+
+  if (desiredConfig.clientSettings.playerBackend === "mpv") {
+    if (deltaMs > 0) {
+      const paused = await sendMpvIpcCommand(["set_property", "pause", true]);
+      if (!paused) {
+        return false;
+      }
+
+      appendLog(`Applying live mpv sync nudge: +${deltaMs}ms pause`);
+      setTimeout(() => {
+        sendMpvIpcCommand(["set_property", "pause", false])
+          .then((ok) => {
+            if (!ok) {
+              appendLog("Failed to resume mpv after sync nudge");
+            }
+          })
+          .catch((error) => appendLog(`Failed to resume mpv after sync nudge: ${String(error)}`));
+      }, deltaMs);
+      return true;
+    }
+
+    const seekSeconds = Math.abs(deltaMs) / 1000;
+    const seeked = await sendMpvIpcCommand(["seek", seekSeconds, "relative+exact"]);
+    if (!seeked) {
+      return false;
+    }
+    appendLog(`Applying live mpv sync nudge: ${deltaMs}ms seek forward`);
+    return true;
+  }
+
+  if (desiredConfig.clientSettings.playerBackend !== "gstreamer" || deltaMs < 0) {
     return false;
   }
 
