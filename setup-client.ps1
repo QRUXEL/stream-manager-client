@@ -421,7 +421,7 @@ function Resolve-MpvCommandPath {
 }
 
 function Find-MpvExecutableWithWhere {
-  $commands = @('mpv.exe', 'mpvnet.exe')
+  $commands = @('mpv.com', 'mpv.exe', 'mpvnet.exe')
   foreach ($commandName in $commands) {
     Write-Host "[mpv-discovery] where lookup for: $commandName"
     $cmdOutput = (& cmd.exe /c "where $commandName 2>nul")
@@ -443,8 +443,10 @@ function Find-MpvExecutableWithWhere {
 
 function Find-MpvExecutableFromCommonPaths {
   $candidates = @(
+    (Join-Path $env:ProgramFiles 'MPV Player\mpv.com'),
     (Join-Path $env:ProgramFiles 'MPV Player\mpv.exe'),
     (Join-Path $env:ProgramFiles 'MPV Player\mpvnet.exe'),
+    (Join-Path ${env:ProgramFiles(x86)} 'MPV Player\mpv.com'),
     (Join-Path ${env:ProgramFiles(x86)} 'MPV Player\mpv.exe'),
     (Join-Path ${env:ProgramFiles(x86)} 'MPV Player\mpvnet.exe'),
     (Join-Path $env:LOCALAPPDATA 'Programs\mpv.net\mpv.exe'),
@@ -465,12 +467,14 @@ function Find-MpvExecutableFromCommonPaths {
   $wingetRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
   Write-Host "[mpv-discovery] winget package scan root: $wingetRoot"
   if (Test-Path -Path $wingetRoot) {
-    $wingetMatch = Get-ChildItem -Path $wingetRoot -Filter mpv.exe -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($wingetMatch) {
-      Write-Host "[mpv-discovery] winget package accepted: $($wingetMatch.FullName)"
-      return $wingetMatch.FullName
+    foreach ($target in @('mpv.com', 'mpv.exe', 'mpvnet.exe')) {
+      $wingetMatch = Get-ChildItem -Path $wingetRoot -Filter $target -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($wingetMatch) {
+        Write-Host "[mpv-discovery] winget package accepted: $($wingetMatch.FullName)"
+        return $wingetMatch.FullName
+      }
     }
-    Write-Host '[mpv-discovery] winget package scan did not find mpv.exe'
+    Write-Host '[mpv-discovery] winget package scan did not find mpv.com/mpv.exe/mpvnet.exe'
   } else {
     Write-Host '[mpv-discovery] winget package root does not exist'
   }
@@ -502,6 +506,13 @@ function Find-MpvExecutableFromRegistry {
 
         Write-Host "[mpv-discovery] registry candidate root ($propertyName): $root"
 
+        $directCom = Join-Path $root 'mpv.com'
+        Write-Host "[mpv-discovery] registry direct candidate: $directCom"
+        if (Test-Path -Path $directCom) {
+          Write-Host "[mpv-discovery] registry accepted direct candidate: $directCom"
+          return $directCom
+        }
+
         $direct = Join-Path $root 'mpv.exe'
         Write-Host "[mpv-discovery] registry direct candidate: $direct"
         if (Test-Path -Path $direct) {
@@ -516,7 +527,7 @@ function Find-MpvExecutableFromRegistry {
           return $directMpvNet
         }
 
-        foreach ($target in @('mpv.exe', 'mpvnet.exe')) {
+        foreach ($target in @('mpv.com', 'mpv.exe', 'mpvnet.exe')) {
           $deep = Get-ChildItem -Path $root -Filter $target -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($deep) {
             Write-Host "[mpv-discovery] registry accepted recursive candidate: $($deep.FullName)"
@@ -565,7 +576,25 @@ function Get-RunnableMpvExecutable {
       }
       Write-Host "[mpv-discovery] candidate failed --help with exit code ${LASTEXITCODE}: $candidate"
 
-      if ($candidate -match '(?i)mpv(?:net)?\.exe$') {
+      if ($candidate -match '(?i)\.exe$') {
+        $siblingCom = [System.IO.Path]::ChangeExtension($candidate, 'com')
+        if (Test-Path -Path $siblingCom) {
+          Write-Host "[mpv-discovery] trying sibling .com candidate: $siblingCom"
+          & $siblingCom --version *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "[mpv-discovery] sibling .com runnable: $siblingCom"
+            return $siblingCom
+          }
+          & $siblingCom --help *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "[mpv-discovery] sibling .com runnable via --help: $siblingCom"
+            return $siblingCom
+          }
+          Write-Host "[mpv-discovery] sibling .com failed probes with exit code ${LASTEXITCODE}: $siblingCom"
+        }
+      }
+
+      if ($candidate -match '(?i)mpv(?:net)?\.(?:exe|com)$') {
         Write-Host "[mpv-discovery] accepting candidate despite probe failures (known mpv build behavior): $candidate"
         return $candidate
       }
@@ -626,6 +655,22 @@ function Ensure-MpvInstalled {
   }
 
   & $mpvSource --version *> $null
+  if ($LASTEXITCODE -ne 0) {
+    & $mpvSource --help *> $null
+  }
+  if ($LASTEXITCODE -ne 0 -and $mpvSource -match '(?i)\.exe$') {
+    $mpvCom = [System.IO.Path]::ChangeExtension($mpvSource, 'com')
+    if (Test-Path -Path $mpvCom) {
+      Write-Host "[mpv-discovery] final validation switching to sibling .com: $mpvCom"
+      & $mpvCom --version *> $null
+      if ($LASTEXITCODE -ne 0) {
+        & $mpvCom --help *> $null
+      }
+      if ($LASTEXITCODE -eq 0) {
+        $mpvSource = $mpvCom
+      }
+    }
+  }
   if ($LASTEXITCODE -ne 0) {
     Write-Host "Warning: mpv command was found but failed to execute at $mpvSource"
     Write-Host 'Continuing setup without mpv. Client will use ffplay/gstreamer unless MPV_PATH is configured later.'

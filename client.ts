@@ -1535,6 +1535,23 @@ function probeMpvExecutable(command: string) {
   }
 
   const name = basename(normalized).toLowerCase();
+  if (name === "mpv.exe") {
+    const siblingCom = normalized.replace(/\.exe$/i, ".com");
+    if (siblingCom !== normalized && existsSync(siblingCom)) {
+      try {
+        const probeSibling = Bun.spawnSync([siblingCom, "--version"], {
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        if (probeSibling.exitCode === 0) {
+          return true;
+        }
+      } catch {
+      }
+    }
+  }
+
   if (name === "mpv.exe" || name === "mpvnet.exe") {
     appendLog(`Accepting mpv candidate despite probe failure: ${normalized}`);
     return true;
@@ -1566,7 +1583,7 @@ function resolveMpvExecutablePath() {
 
       for (const entry of entries) {
         const full = join(dir, entry);
-        if (/^mpv(?:net)?(?:\.exe)?$/i.test(entry) && probeMpvExecutable(full)) {
+        if (/^mpv(?:net)?(?:\.(?:exe|com))?$/i.test(entry) && probeMpvExecutable(full)) {
           return full;
         }
       }
@@ -1602,13 +1619,17 @@ function resolveMpvExecutablePath() {
   const candidates = [
     String(Bun.env.MPV_PATH || "").trim(),
     String(mpvPath || "").trim(),
+    "mpv.com",
     "mpv.exe",
     "mpv",
     "mpvnet.exe",
+    localAppData ? join(localAppData, "Programs", "mpv.net", "mpv.com") : "",
     localMpvNetMpv,
     localMpvNetMpvNet,
+    "C:\\Program Files\\MPV Player\\mpv.com",
     "C:\\Program Files\\MPV Player\\mpv.exe",
     "C:\\Program Files\\MPV Player\\mpvnet.exe",
+    "C:\\Program Files (x86)\\MPV Player\\mpv.com",
     "C:\\Program Files (x86)\\MPV Player\\mpv.exe",
     "C:\\Program Files (x86)\\MPV Player\\mpvnet.exe",
     "C:\\Program Files\\mpv\\mpv.exe",
@@ -1646,7 +1667,7 @@ function resolveMpvExecutablePath() {
   }
 
   try {
-    const whereResult = Bun.spawnSync(["cmd", "/c", "where mpv.exe mpvnet.exe 2>nul"], {
+    const whereResult = Bun.spawnSync(["cmd", "/c", "where mpv.com mpv.exe mpvnet.exe 2>nul"], {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "ignore",
