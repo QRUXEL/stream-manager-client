@@ -1506,7 +1506,10 @@ function probeMpvExecutable(command: string) {
     return false;
   }
 
-  if ((normalized.includes("\\") || normalized.includes("/")) && !existsSync(normalized)) {
+  const hasPathSeparator = normalized.includes("\\") || normalized.includes("/");
+  const existsAsPath = existsSync(normalized);
+
+  if (hasPathSeparator && !existsAsPath) {
     return false;
   }
 
@@ -1552,7 +1555,7 @@ function probeMpvExecutable(command: string) {
     }
   }
 
-  if (name === "mpv.exe" || name === "mpvnet.exe") {
+  if ((name === "mpv.exe" || name === "mpvnet.exe") && (hasPathSeparator || existsAsPath)) {
     appendLog(`Accepting mpv candidate despite probe failure: ${normalized}`);
     return true;
   }
