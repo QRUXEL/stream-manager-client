@@ -969,15 +969,21 @@ function spawnFfplayNow(config: RuntimeConfig) {
 }
 
 function buildGstreamerArgs(config: RuntimeConfig) {
-  const args: string[] = ["--no-interactive"];
+  const args: string[] = [];
+  const wantsFullscreen = config.globalFfplaySettings.fullScreen.enabled && config.globalFfplaySettings.fullScreen.value;
   let fullscreenViaFlag = false;
 
-  if (config.globalFfplaySettings.fullScreen.enabled && config.globalFfplaySettings.fullScreen.value) {
+  if (wantsFullscreen) {
     const fullscreenFlag = resolveGstreamerFullscreenFlag();
     if (fullscreenFlag) {
       args.push(fullscreenFlag);
       fullscreenViaFlag = true;
     }
+  }
+
+  // Interactive mode is required for key-driven fullscreen toggle fallback.
+  if (!wantsFullscreen || fullscreenViaFlag) {
+    args.push("--no-interactive");
   }
 
   if (config.stream?.url) {
@@ -1054,7 +1060,7 @@ function spawnGstreamerNow(config: RuntimeConfig) {
     .catch((error) => appendLog(`gstreamer stderr pipe error: ${String(error)}`));
 
   if (config.globalFfplaySettings.fullScreen.enabled && config.globalFfplaySettings.fullScreen.value && !fullscreenViaFlag) {
-    appendLog("GStreamer fullscreen flag is unavailable; attempting fullscreen toggle via stdin keypress");
+    appendLog("GStreamer fullscreen flag is unavailable; attempting fullscreen toggle via stdin keypress (interactive mode)");
     setTimeout(() => {
       if (activeProcess !== processRef) {
         return;
