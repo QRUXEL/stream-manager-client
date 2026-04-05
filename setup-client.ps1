@@ -401,6 +401,7 @@ function Get-MpvCommand {
 function Resolve-MpvCommandPath {
   $mpvCommand = Get-MpvCommand
   if (-not $mpvCommand) {
+    Write-Host '[mpv-discovery] Get-Command did not find mpv.exe/mpv'
     return $null
   }
 
@@ -410,8 +411,11 @@ function Resolve-MpvCommandPath {
   }
 
   if ([string]::IsNullOrWhiteSpace($mpvSource) -or -not (Test-Path -Path $mpvSource)) {
+    Write-Host "[mpv-discovery] Get-Command returned non-existent path: $mpvSource"
     return $null
   }
+
+  Write-Host "[mpv-discovery] Get-Command candidate: $mpvSource"
 
   return $mpvSource
 }
@@ -419,10 +423,16 @@ function Resolve-MpvCommandPath {
 function Find-MpvExecutableWithWhere {
   $commands = @('mpv.exe', 'mpvnet.exe')
   foreach ($commandName in $commands) {
+    Write-Host "[mpv-discovery] where lookup for: $commandName"
     $cmdOutput = (& cmd.exe /c "where $commandName 2>nul")
     $matches = @($cmdOutput | ForEach-Object { ($_ | Out-String).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if (-not $matches -or $matches.Count -eq 0) {
+      Write-Host "[mpv-discovery] where returned no results for: $commandName"
+    }
     foreach ($candidate in $matches) {
+      Write-Host "[mpv-discovery] where candidate: $candidate"
       if (Test-Path -Path $candidate) {
+        Write-Host "[mpv-discovery] where accepted: $candidate"
         return $candidate
       }
     }
@@ -443,17 +453,24 @@ function Find-MpvExecutableFromCommonPaths {
   )
 
   foreach ($candidate in $candidates) {
+    Write-Host "[mpv-discovery] common-path candidate: $candidate"
     if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -Path $candidate)) {
+      Write-Host "[mpv-discovery] common-path accepted: $candidate"
       return $candidate
     }
   }
 
   $wingetRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+  Write-Host "[mpv-discovery] winget package scan root: $wingetRoot"
   if (Test-Path -Path $wingetRoot) {
     $wingetMatch = Get-ChildItem -Path $wingetRoot -Filter mpv.exe -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($wingetMatch) {
+      Write-Host "[mpv-discovery] winget package accepted: $($wingetMatch.FullName)"
       return $wingetMatch.FullName
     }
+    Write-Host '[mpv-discovery] winget package scan did not find mpv.exe'
+  } else {
+    Write-Host '[mpv-discovery] winget package root does not exist'
   }
 
   return $null
@@ -467,6 +484,7 @@ function Find-MpvExecutableFromRegistry {
   )
 
   foreach ($registryPath in $registryPaths) {
+    Write-Host "[mpv-discovery] registry scan path: $registryPath"
     $items = Get-ItemProperty -Path $registryPath -ErrorAction SilentlyContinue
     foreach ($item in $items) {
       $displayName = [string]$item.DisplayName
@@ -480,13 +498,18 @@ function Find-MpvExecutableFromRegistry {
           continue
         }
 
+        Write-Host "[mpv-discovery] registry candidate root ($propertyName): $root"
+
         $direct = Join-Path $root 'mpv.exe'
+        Write-Host "[mpv-discovery] registry direct candidate: $direct"
         if (Test-Path -Path $direct) {
+          Write-Host "[mpv-discovery] registry accepted direct candidate: $direct"
           return $direct
         }
 
         $deep = Get-ChildItem -Path $root -Filter mpv.exe -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($deep) {
+          Write-Host "[mpv-discovery] registry accepted recursive candidate: $($deep.FullName)"
           return $deep.FullName
         }
       }
@@ -505,16 +528,24 @@ function Get-RunnableMpvExecutable {
   ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
 
   $uniqueCandidates = @($candidates | Select-Object -Unique)
+  if (-not $uniqueCandidates -or $uniqueCandidates.Count -eq 0) {
+    Write-Host '[mpv-discovery] No discovery candidates produced.'
+  }
+
   foreach ($candidate in $uniqueCandidates) {
+    Write-Host "[mpv-discovery] probing candidate: $candidate"
     if (-not (Test-Path -Path $candidate)) {
+      Write-Host "[mpv-discovery] candidate path does not exist: $candidate"
       continue
     }
 
     try {
       & $candidate --version *> $null
       if ($LASTEXITCODE -eq 0) {
+        Write-Host "[mpv-discovery] candidate runnable: $candidate"
         return $candidate
       }
+      Write-Host "[mpv-discovery] candidate failed --version with exit code $LASTEXITCODE: $candidate"
     }
     catch {
       Write-Host "Discovered mpv candidate is not runnable: $candidate"
@@ -525,6 +556,7 @@ function Get-RunnableMpvExecutable {
 }
 
 function Ensure-MpvInstalled {
+  Write-Host '[mpv-discovery] Starting mpv discovery/install sequence'
   $mpvSource = Get-RunnableMpvExecutable
   if (-not $mpvSource) {
     Write-Host 'mpv not found. Installing with winget...'
