@@ -444,7 +444,9 @@ function Find-MpvExecutableWithWhere {
 function Find-MpvExecutableFromCommonPaths {
   $candidates = @(
     (Join-Path $env:ProgramFiles 'MPV Player\mpv.exe'),
+    (Join-Path $env:ProgramFiles 'MPV Player\mpvnet.exe'),
     (Join-Path ${env:ProgramFiles(x86)} 'MPV Player\mpv.exe'),
+    (Join-Path ${env:ProgramFiles(x86)} 'MPV Player\mpvnet.exe'),
     (Join-Path $env:LOCALAPPDATA 'Programs\mpv.net\mpv.exe'),
     (Join-Path $env:LOCALAPPDATA 'Programs\mpv.net\mpvnet.exe'),
     (Join-Path $env:ProgramFiles 'mpv\mpv.exe'),
@@ -507,10 +509,19 @@ function Find-MpvExecutableFromRegistry {
           return $direct
         }
 
-        $deep = Get-ChildItem -Path $root -Filter mpv.exe -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($deep) {
-          Write-Host "[mpv-discovery] registry accepted recursive candidate: $($deep.FullName)"
-          return $deep.FullName
+        $directMpvNet = Join-Path $root 'mpvnet.exe'
+        Write-Host "[mpv-discovery] registry direct candidate: $directMpvNet"
+        if (Test-Path -Path $directMpvNet) {
+          Write-Host "[mpv-discovery] registry accepted direct candidate: $directMpvNet"
+          return $directMpvNet
+        }
+
+        foreach ($target in @('mpv.exe', 'mpvnet.exe')) {
+          $deep = Get-ChildItem -Path $root -Filter $target -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($deep) {
+            Write-Host "[mpv-discovery] registry accepted recursive candidate: $($deep.FullName)"
+            return $deep.FullName
+          }
         }
       }
     }
@@ -546,6 +557,18 @@ function Get-RunnableMpvExecutable {
         return $candidate
       }
       Write-Host "[mpv-discovery] candidate failed --version with exit code ${LASTEXITCODE}: $candidate"
+
+      & $candidate --help *> $null
+      if ($LASTEXITCODE -eq 0) {
+        Write-Host "[mpv-discovery] candidate runnable via --help: $candidate"
+        return $candidate
+      }
+      Write-Host "[mpv-discovery] candidate failed --help with exit code ${LASTEXITCODE}: $candidate"
+
+      if ($candidate -match '(?i)mpv(?:net)?\.exe$') {
+        Write-Host "[mpv-discovery] accepting candidate despite probe failures (known mpv build behavior): $candidate"
+        return $candidate
+      }
     }
     catch {
       Write-Host "Discovered mpv candidate is not runnable: $candidate"

@@ -1,7 +1,7 @@
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createSocket } from "node:dgram";
 import { createConnection } from "node:net";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 type StreamConfig = {
   id: string;
@@ -1516,10 +1516,31 @@ function probeMpvExecutable(command: string) {
       stdout: "ignore",
       stderr: "ignore",
     });
-    return probe.exitCode === 0;
+    if (probe.exitCode === 0) {
+      return true;
+    }
   } catch {
-    return false;
   }
+
+  try {
+    const probeHelp = Bun.spawnSync([normalized, "--help"], {
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    if (probeHelp.exitCode === 0) {
+      return true;
+    }
+  } catch {
+  }
+
+  const name = basename(normalized).toLowerCase();
+  if (name === "mpv.exe" || name === "mpvnet.exe") {
+    appendLog(`Accepting mpv candidate despite probe failure: ${normalized}`);
+    return true;
+  }
+
+  return false;
 }
 
 function resolveMpvExecutablePath() {
@@ -1545,7 +1566,7 @@ function resolveMpvExecutablePath() {
 
       for (const entry of entries) {
         const full = join(dir, entry);
-        if (/^mpv(?:\.exe)?$/i.test(entry) && probeMpvExecutable(full)) {
+        if (/^mpv(?:net)?(?:\.exe)?$/i.test(entry) && probeMpvExecutable(full)) {
           return full;
         }
       }
@@ -1587,7 +1608,9 @@ function resolveMpvExecutablePath() {
     localMpvNetMpv,
     localMpvNetMpvNet,
     "C:\\Program Files\\MPV Player\\mpv.exe",
+    "C:\\Program Files\\MPV Player\\mpvnet.exe",
     "C:\\Program Files (x86)\\MPV Player\\mpv.exe",
+    "C:\\Program Files (x86)\\MPV Player\\mpvnet.exe",
     "C:\\Program Files\\mpv\\mpv.exe",
     "C:\\Program Files (x86)\\mpv\\mpv.exe",
   ].filter((item) => item.length > 0);
@@ -1623,7 +1646,7 @@ function resolveMpvExecutablePath() {
   }
 
   try {
-    const whereResult = Bun.spawnSync(["cmd", "/c", "where mpv.exe 2>nul"], {
+    const whereResult = Bun.spawnSync(["cmd", "/c", "where mpv.exe mpvnet.exe 2>nul"], {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "ignore",
