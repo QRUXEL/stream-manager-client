@@ -453,6 +453,14 @@ function Ensure-MpvInstalled {
     throw 'mpv command was found but failed to execute.'
   }
 
+  $env:MPV_PATH = $mpvSource
+  try {
+    [System.Environment]::SetEnvironmentVariable('MPV_PATH', $mpvSource, 'User')
+  }
+  catch {
+    Write-Host 'Warning: unable to persist MPV_PATH to user environment; continuing with current process value.'
+  }
+
   Write-Host "Using mpv executable: $mpvSource"
 }
 

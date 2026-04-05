@@ -119,6 +119,7 @@ let bufferHeadroomMs: number | null = null;
 let shuttingDown = false;
 let gstreamerHelpTextCache: string | null = null;
 const gstreamerExecutableAvailabilityCache = new Map<string, boolean>();
+let resolvedMpvExecutablePath: string | null = null;
 let mpvIpcPipePath: string | null = null;
 let mpvPreviewDataUrl: string | null = null;
 let mpvPreviewCapturedAt: string | null = null;
@@ -1496,7 +1497,11 @@ function buildFfplayArgs(config: RuntimeConfig) {
 }
 
 function canRunMpvExecutable() {
-  const normalized = String(mpvPath || "").trim();
+  return Boolean(resolveMpvExecutablePath());
+}
+
+function probeMpvExecutable(command: string) {
+  const normalized = String(command || "").trim();
   if (!normalized) {
     return false;
   }
@@ -1515,6 +1520,54 @@ function canRunMpvExecutable() {
   } catch {
     return false;
   }
+}
+
+function resolveMpvExecutablePath() {
+  if (resolvedMpvExecutablePath && probeMpvExecutable(resolvedMpvExecutablePath)) {
+    return resolvedMpvExecutablePath;
+  }
+
+  const candidates = [
+    String(Bun.env.MPV_PATH || "").trim(),
+    String(mpvPath || "").trim(),
+    "mpv.exe",
+    "mpv",
+    "C:\\Program Files\\mpv\\mpv.exe",
+    "C:\\Program Files (x86)\\mpv\\mpv.exe",
+  ].filter((item) => item.length > 0);
+
+  for (const candidate of candidates) {
+    if (probeMpvExecutable(candidate)) {
+      resolvedMpvExecutablePath = candidate;
+      return candidate;
+    }
+  }
+
+  try {
+    const whereResult = Bun.spawnSync(["cmd", "/c", "where mpv.exe 2>nul"], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (whereResult.exitCode === 0 && whereResult.stdout) {
+      const lines = textDecoder
+        .decode(whereResult.stdout)
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+
+      for (const line of lines) {
+        if (probeMpvExecutable(line)) {
+          resolvedMpvExecutablePath = line;
+          return line;
+        }
+      }
+    }
+  } catch {
+  }
+
+  resolvedMpvExecutablePath = null;
+  return null;
 }
 
 function buildMpvArgs(config: RuntimeConfig) {
@@ -1567,14 +1620,15 @@ function buildMpvArgs(config: RuntimeConfig) {
 }
 
 function spawnMpvNow(config: RuntimeConfig) {
+  const executable = resolveMpvExecutablePath() || mpvPath;
   const nextPipePath = `\\\\.\\pipe\\stream-manager-mpv-${clientId}-${Date.now()}`;
   const args = buildMpvArgs(config);
   args.unshift(`--input-ipc-server=${nextPipePath}`);
   args.unshift("--screenshot-format=jpg", "--screenshot-jpeg-quality=72");
-  currentCommandLine = buildCommandLine(mpvPath, args);
-  appendLog(`Starting mpv: ${mpvPath} ${args.join(" ")}`);
+  currentCommandLine = buildCommandLine(executable, args);
+  appendLog(`Starting mpv: ${executable} ${args.join(" ")}`);
 
-  const processRef = Bun.spawn([mpvPath, ...args], {
+  const processRef = Bun.spawn([executable, ...args], {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
