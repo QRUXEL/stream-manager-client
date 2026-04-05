@@ -545,7 +545,7 @@ function Get-RunnableMpvExecutable {
         Write-Host "[mpv-discovery] candidate runnable: $candidate"
         return $candidate
       }
-      Write-Host "[mpv-discovery] candidate failed --version with exit code $LASTEXITCODE: $candidate"
+      Write-Host "[mpv-discovery] candidate failed --version with exit code ${LASTEXITCODE}: $candidate"
     }
     catch {
       Write-Host "Discovered mpv candidate is not runnable: $candidate"
