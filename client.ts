@@ -70,6 +70,8 @@ const clientName = Bun.env.CLIENT_NAME || clientId;
 const clientDir = import.meta.dir;
 const ffplayPath = join(clientDir, "ffplay.exe");
 const gstreamerPath = String(Bun.env.GSTREAMER_PATH || "").trim() || "gst-play-1.0";
+const gstreamerLaunchPath = String(Bun.env.GSTREAMER_LAUNCH_PATH || "").trim() || "gst-launch-1.0";
+const gstreamerPlayerMode = String(Bun.env.GSTREAMER_PLAYER_MODE || "auto").trim().toLowerCase();
 const persistedConfigPath = "./last-config.json";
 const lockFilePath = "./client.lock";
 const overlayAppDir = join(clientDir, "electron-overlay");
@@ -114,6 +116,7 @@ let bufferWindowMs: number | null = null;
 let bufferHeadroomMs: number | null = null;
 let shuttingDown = false;
 let gstreamerHelpTextCache: string | null = null;
+const gstreamerExecutableAvailabilityCache = new Map<string, boolean>();
 
 function clearDelayedStartTimer() {
   if (delayedStartTimer) {
@@ -1036,12 +1039,147 @@ function resolveGstreamerFullscreenFlag() {
   return null;
 }
 
-function spawnGstreamerNow(config: RuntimeConfig) {
-  const { args, fullscreenViaFlag } = buildGstreamerArgs(config);
-  currentCommandLine = buildCommandLine(gstreamerPath, args);
-  appendLog(`Starting gstreamer: ${gstreamerPath} ${args.join(" ")}`);
+function isPathLikeCommand(command: string) {
+  return command.includes("\\") || command.includes("/");
+}
 
-  const processRef = Bun.spawn([gstreamerPath, ...args], {
+function canRunGstreamerExecutable(command: string) {
+  const normalized = String(command || "").trim();
+  if (!normalized) {
+    return false;
+  }
+
+  if (isPathLikeCommand(normalized) && !existsSync(normalized)) {
+    return false;
+  }
+
+  if (gstreamerExecutableAvailabilityCache.has(normalized)) {
+    return Boolean(gstreamerExecutableAvailabilityCache.get(normalized));
+  }
+
+  let available = false;
+  try {
+    const probe = Bun.spawnSync([normalized, "--version"], {
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    available = probe.exitCode === 0;
+  } catch {
+    available = false;
+  }
+
+  gstreamerExecutableAvailabilityCache.set(normalized, available);
+  return available;
+}
+
+function shouldUseGstLaunchForConfig(config: RuntimeConfig) {
+  if (gstreamerPlayerMode === "gst-launch") {
+    return true;
+  }
+
+  if (gstreamerPlayerMode === "gst-play") {
+    return false;
+  }
+
+  const wantsFullscreen = config.globalFfplaySettings.fullScreen.enabled && config.globalFfplaySettings.fullScreen.value;
+  if (!wantsFullscreen) {
+    return false;
+  }
+
+  // When gst-play has no fullscreen flag support, gst-launch with d3d11videosink fullscreen is a better fit.
+  return !Boolean(resolveGstreamerFullscreenFlag());
+}
+
+function buildGstreamerPlayArgs(config: RuntimeConfig) {
+  const args: string[] = [];
+  const wantsFullscreen = config.globalFfplaySettings.fullScreen.enabled && config.globalFfplaySettings.fullScreen.value;
+  let fullscreenViaFlag = false;
+
+  if (wantsFullscreen) {
+    const fullscreenFlag = resolveGstreamerFullscreenFlag();
+    if (fullscreenFlag) {
+      args.push(fullscreenFlag);
+      fullscreenViaFlag = true;
+    }
+  }
+
+  // Interactive mode is required for key-driven fullscreen toggle fallback.
+  if (!wantsFullscreen || fullscreenViaFlag) {
+    args.push("--no-interactive");
+  }
+
+  if (config.stream?.url) {
+    args.push(config.stream.url);
+  }
+
+  return { args, fullscreenViaFlag };
+}
+
+function buildGstreamerLaunchArgs(config: RuntimeConfig) {
+  const streamUrl = String(config.stream?.url || "").trim();
+  const wantsFullscreen = config.globalFfplaySettings.fullScreen.enabled && config.globalFfplaySettings.fullScreen.value;
+
+  const sinkParts: string[] = ["d3d11videosink"];
+  if (wantsFullscreen) {
+    sinkParts.push("fullscreen=true");
+  }
+
+  const args: string[] = [
+    "-e",
+    "playbin",
+    `uri=${streamUrl}`,
+    `video-sink=${sinkParts.join(" ")}`,
+  ];
+
+  const muted = config.globalFfplaySettings.mute.enabled && config.globalFfplaySettings.mute.value;
+  if (muted) {
+    args.push("audio-sink=fakesink");
+  } else {
+    args.push("audio-sink=autoaudiosink");
+
+    if (config.globalFfplaySettings.volume.enabled) {
+      const volumePercent = Math.max(0, Math.min(200, Math.round(config.globalFfplaySettings.volume.value ?? 100)));
+      const gstVolume = Math.max(0, Math.min(2, volumePercent / 100));
+      args.push(`volume=${gstVolume.toFixed(3)}`);
+    }
+  }
+
+  return { args, fullscreenViaFlag: wantsFullscreen };
+}
+
+function spawnGstreamerNow(config: RuntimeConfig) {
+  const preferLaunch = shouldUseGstLaunchForConfig(config);
+  const canRunPlay = canRunGstreamerExecutable(gstreamerPath);
+  const canRunLaunch = canRunGstreamerExecutable(gstreamerLaunchPath);
+
+  let executable = gstreamerPath;
+  let plan = buildGstreamerPlayArgs(config);
+
+  if (preferLaunch && canRunLaunch) {
+    executable = gstreamerLaunchPath;
+    plan = buildGstreamerLaunchArgs(config);
+    appendLog("Using gst-launch for gstreamer playback");
+  } else if (!preferLaunch && canRunPlay) {
+    executable = gstreamerPath;
+    plan = buildGstreamerPlayArgs(config);
+  } else if (canRunPlay) {
+    executable = gstreamerPath;
+    plan = buildGstreamerPlayArgs(config);
+    appendLog("Requested gst-launch mode is unavailable; using gst-play fallback");
+  } else if (canRunLaunch) {
+    executable = gstreamerLaunchPath;
+    plan = buildGstreamerLaunchArgs(config);
+    appendLog("gst-play is unavailable; using gst-launch fallback");
+  } else {
+    throw new Error(`No runnable gstreamer executable found (tried ${gstreamerPath} and ${gstreamerLaunchPath})`);
+  }
+
+  const { args, fullscreenViaFlag } = plan;
+  currentCommandLine = buildCommandLine(executable, args);
+  appendLog(`Starting gstreamer: ${executable} ${args.join(" ")}`);
+
+  const processRef = Bun.spawn([executable, ...args], {
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -1059,7 +1197,7 @@ function spawnGstreamerNow(config: RuntimeConfig) {
   pipeStreamToLogs(processRef.stderr, "gst-stderr", appendLog, updateVideoTimestampFromFfplayLine)
     .catch((error) => appendLog(`gstreamer stderr pipe error: ${String(error)}`));
 
-  if (config.globalFfplaySettings.fullScreen.enabled && config.globalFfplaySettings.fullScreen.value && !fullscreenViaFlag) {
+  if (executable === gstreamerPath && config.globalFfplaySettings.fullScreen.enabled && config.globalFfplaySettings.fullScreen.value && !fullscreenViaFlag) {
     appendLog("GStreamer fullscreen flag is unavailable; attempting fullscreen toggle via stdin keypress (interactive mode)");
     setTimeout(() => {
       if (activeProcess !== processRef) {
