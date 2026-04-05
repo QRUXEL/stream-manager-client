@@ -398,9 +398,128 @@ function Get-MpvCommand {
   return (Get-Command mpv -ErrorAction SilentlyContinue)
 }
 
-function Ensure-MpvInstalled {
+function Resolve-MpvCommandPath {
   $mpvCommand = Get-MpvCommand
   if (-not $mpvCommand) {
+    return $null
+  }
+
+  $mpvSource = $mpvCommand.Source
+  if ([string]::IsNullOrWhiteSpace($mpvSource) -and $mpvCommand.PSObject.Properties['Path']) {
+    $mpvSource = $mpvCommand.Path
+  }
+
+  if ([string]::IsNullOrWhiteSpace($mpvSource) -or -not (Test-Path -Path $mpvSource)) {
+    return $null
+  }
+
+  return $mpvSource
+}
+
+function Find-MpvExecutableWithWhere {
+  $cmdOutput = (& cmd.exe /c "where mpv.exe 2>nul")
+  $matches = @($cmdOutput | ForEach-Object { ($_ | Out-String).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+  foreach ($candidate in $matches) {
+    if (Test-Path -Path $candidate) {
+      return $candidate
+    }
+  }
+
+  return $null
+}
+
+function Find-MpvExecutableFromCommonPaths {
+  $candidates = @(
+    (Join-Path $env:ProgramFiles 'mpv\mpv.exe'),
+    (Join-Path ${env:ProgramFiles(x86)} 'mpv\mpv.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Programs\mpv\mpv.exe')
+  )
+
+  foreach ($candidate in $candidates) {
+    if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -Path $candidate)) {
+      return $candidate
+    }
+  }
+
+  $wingetRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+  if (Test-Path -Path $wingetRoot) {
+    $wingetMatch = Get-ChildItem -Path $wingetRoot -Filter mpv.exe -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($wingetMatch) {
+      return $wingetMatch.FullName
+    }
+  }
+
+  return $null
+}
+
+function Find-MpvExecutableFromRegistry {
+  $registryPaths = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+  )
+
+  foreach ($registryPath in $registryPaths) {
+    $items = Get-ItemProperty -Path $registryPath -ErrorAction SilentlyContinue
+    foreach ($item in $items) {
+      $displayName = [string]$item.DisplayName
+      if ([string]::IsNullOrWhiteSpace($displayName) -or $displayName -notmatch 'mpv') {
+        continue
+      }
+
+      foreach ($propertyName in @('InstallLocation', 'InstallSource')) {
+        $root = [string]$item.$propertyName
+        if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -Path $root)) {
+          continue
+        }
+
+        $direct = Join-Path $root 'mpv.exe'
+        if (Test-Path -Path $direct) {
+          return $direct
+        }
+
+        $deep = Get-ChildItem -Path $root -Filter mpv.exe -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($deep) {
+          return $deep.FullName
+        }
+      }
+    }
+  }
+
+  return $null
+}
+
+function Get-RunnableMpvExecutable {
+  $candidates = @(
+    (Resolve-MpvCommandPath),
+    (Find-MpvExecutableWithWhere),
+    (Find-MpvExecutableFromCommonPaths),
+    (Find-MpvExecutableFromRegistry)
+  ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+  $uniqueCandidates = @($candidates | Select-Object -Unique)
+  foreach ($candidate in $uniqueCandidates) {
+    if (-not (Test-Path -Path $candidate)) {
+      continue
+    }
+
+    try {
+      & $candidate --version *> $null
+      if ($LASTEXITCODE -eq 0) {
+        return $candidate
+      }
+    }
+    catch {
+      Write-Host "Discovered mpv candidate is not runnable: $candidate"
+    }
+  }
+
+  return $null
+}
+
+function Ensure-MpvInstalled {
+  $mpvSource = Get-RunnableMpvExecutable
+  if (-not $mpvSource) {
     Write-Host 'mpv not found. Installing with winget...'
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
       throw 'winget is not available; cannot auto-install mpv.'
@@ -426,26 +545,20 @@ function Ensure-MpvInstalled {
     if (-not $installed) {
       Write-Host 'mpv install by package ID failed. Trying name-based install...'
       winget install --name mpv -e --source winget --accept-package-agreements --accept-source-agreements
-      if ($LASTEXITCODE -ne 0) {
-        throw 'mpv installation via winget failed.'
+      if ($LASTEXITCODE -eq 0) {
+        $installed = $true
+      }
+      else {
+        Write-Host 'winget name-based install did not apply an install/update. Continuing with binary discovery...'
       }
     }
 
     Refresh-ProcessPath
-    $mpvCommand = Get-MpvCommand
+    $mpvSource = Get-RunnableMpvExecutable
   }
 
-  if (-not $mpvCommand) {
-    throw 'mpv was not found after installation.'
-  }
-
-  $mpvSource = $mpvCommand.Source
-  if ([string]::IsNullOrWhiteSpace($mpvSource) -and $mpvCommand.PSObject.Properties['Path']) {
-    $mpvSource = $mpvCommand.Path
-  }
-
-  if ([string]::IsNullOrWhiteSpace($mpvSource) -or -not (Test-Path -Path $mpvSource)) {
-    throw 'Unable to resolve mpv executable path after installation.'
+  if (-not $mpvSource) {
+    throw 'mpv was not found after installation. Checked PATH, where.exe, common install folders, WinGet packages, and registry-derived paths.'
   }
 
   & $mpvSource --version *> $null
