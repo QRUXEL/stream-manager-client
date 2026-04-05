@@ -417,11 +417,14 @@ function Resolve-MpvCommandPath {
 }
 
 function Find-MpvExecutableWithWhere {
-  $cmdOutput = (& cmd.exe /c "where mpv.exe 2>nul")
-  $matches = @($cmdOutput | ForEach-Object { ($_ | Out-String).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-  foreach ($candidate in $matches) {
-    if (Test-Path -Path $candidate) {
-      return $candidate
+  $commands = @('mpv.exe', 'mpvnet.exe')
+  foreach ($commandName in $commands) {
+    $cmdOutput = (& cmd.exe /c "where $commandName 2>nul")
+    $matches = @($cmdOutput | ForEach-Object { ($_ | Out-String).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    foreach ($candidate in $matches) {
+      if (Test-Path -Path $candidate) {
+        return $candidate
+      }
     }
   }
 
@@ -430,6 +433,10 @@ function Find-MpvExecutableWithWhere {
 
 function Find-MpvExecutableFromCommonPaths {
   $candidates = @(
+    (Join-Path $env:ProgramFiles 'MPV Player\mpv.exe'),
+    (Join-Path ${env:ProgramFiles(x86)} 'MPV Player\mpv.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Programs\mpv.net\mpv.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Programs\mpv.net\mpvnet.exe'),
     (Join-Path $env:ProgramFiles 'mpv\mpv.exe'),
     (Join-Path ${env:ProgramFiles(x86)} 'mpv\mpv.exe'),
     (Join-Path $env:LOCALAPPDATA 'Programs\mpv\mpv.exe')
@@ -558,12 +565,16 @@ function Ensure-MpvInstalled {
   }
 
   if (-not $mpvSource) {
-    throw 'mpv was not found after installation. Checked PATH, where.exe, common install folders, WinGet packages, and registry-derived paths.'
+    Write-Host 'Warning: mpv was not found after installation attempts. Checked PATH, where.exe, common install folders, WinGet packages, and registry-derived paths.'
+    Write-Host 'Continuing setup without mpv. Client will use ffplay/gstreamer unless MPV_PATH is configured later.'
+    return
   }
 
   & $mpvSource --version *> $null
   if ($LASTEXITCODE -ne 0) {
-    throw 'mpv command was found but failed to execute.'
+    Write-Host "Warning: mpv command was found but failed to execute at $mpvSource"
+    Write-Host 'Continuing setup without mpv. Client will use ffplay/gstreamer unless MPV_PATH is configured later.'
+    return
   }
 
   $env:MPV_PATH = $mpvSource

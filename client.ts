@@ -1574,11 +1574,20 @@ function resolveMpvExecutablePath() {
     return walk(root, 0);
   };
 
+  const localAppData = String(Bun.env.LOCALAPPDATA || "").trim();
+  const localMpvNetMpv = localAppData ? join(localAppData, "Programs", "mpv.net", "mpv.exe") : "";
+  const localMpvNetMpvNet = localAppData ? join(localAppData, "Programs", "mpv.net", "mpvnet.exe") : "";
+
   const candidates = [
     String(Bun.env.MPV_PATH || "").trim(),
     String(mpvPath || "").trim(),
     "mpv.exe",
     "mpv",
+    "mpvnet.exe",
+    localMpvNetMpv,
+    localMpvNetMpvNet,
+    "C:\\Program Files\\MPV Player\\mpv.exe",
+    "C:\\Program Files (x86)\\MPV Player\\mpv.exe",
     "C:\\Program Files\\mpv\\mpv.exe",
     "C:\\Program Files (x86)\\mpv\\mpv.exe",
   ].filter((item) => item.length > 0);
