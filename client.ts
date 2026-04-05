@@ -126,6 +126,12 @@ let mpvPreviewCapturedAt: string | null = null;
 let mpvPreviewCaptureInFlight = false;
 let lastMpvPreviewCaptureMs = 0;
 const mpvPreviewCaptureIntervalMs = 4000;
+let mpvIpcHealthy: boolean | null = null;
+let mpvIpcLastCheckedAt: string | null = null;
+let mpvIpcLastError: string | null = null;
+let mpvIpcProbeInFlight = false;
+let lastMpvIpcProbeMs = 0;
+const mpvIpcProbeIntervalMs = 6000;
 
 function clearDelayedStartTimer() {
   if (delayedStartTimer) {
@@ -152,6 +158,39 @@ function resetVideoTimestamp() {
   bufferHeadroomMs = null;
   mpvPreviewDataUrl = null;
   mpvPreviewCapturedAt = null;
+}
+
+async function maybeProbeMpvIpcHealth() {
+  if (!desiredConfig || desiredConfig.clientSettings.playerBackend !== "mpv" || !activeProcess || !mpvIpcPipePath) {
+    mpvIpcHealthy = null;
+    mpvIpcLastCheckedAt = null;
+    mpvIpcLastError = null;
+    return;
+  }
+
+  if (mpvIpcProbeInFlight) {
+    return;
+  }
+
+  const now = Date.now();
+  if (now - lastMpvIpcProbeMs < mpvIpcProbeIntervalMs) {
+    return;
+  }
+
+  mpvIpcProbeInFlight = true;
+  lastMpvIpcProbeMs = now;
+  try {
+    const result = await sendMpvIpcCommand(["get_property", "pause"], true);
+    mpvIpcHealthy = result.ok;
+    mpvIpcLastError = result.ok ? null : String(result.error || "unknown error");
+    mpvIpcLastCheckedAt = new Date().toISOString();
+  } catch (error) {
+    mpvIpcHealthy = false;
+    mpvIpcLastError = String(error);
+    mpvIpcLastCheckedAt = new Date().toISOString();
+  } finally {
+    mpvIpcProbeInFlight = false;
+  }
 }
 
 type MpvIpcResult = {
@@ -1065,6 +1104,7 @@ function publishHealth() {
   bufferWindowMs = nextBufferWindowMs;
   bufferHeadroomMs = nextBufferHeadroomMs;
 
+  maybeProbeMpvIpcHealth().catch((error) => appendLog(`mpv IPC probe failed: ${String(error)}`));
   maybeCaptureMpvPreview().catch((error) => appendLog(`mpv preview task failed: ${String(error)}`));
 
   send("client_health", {
@@ -1087,6 +1127,9 @@ function publishHealth() {
     bufferHeadroomMs: nextBufferHeadroomMs,
     playerPreviewImageDataUrl: mpvPreviewDataUrl,
     playerPreviewCapturedAt: mpvPreviewCapturedAt,
+    mpvIpcHealthy,
+    mpvIpcLastCheckedAt,
+    mpvIpcLastError,
   });
 }
 
@@ -1824,6 +1867,10 @@ function spawnMpvNow(config: RuntimeConfig) {
 
   activeProcess = processRef;
   mpvIpcPipePath = nextPipePath;
+  mpvIpcHealthy = null;
+  mpvIpcLastCheckedAt = null;
+  mpvIpcLastError = null;
+  lastMpvIpcProbeMs = 0;
   appliedLatencyOffsetMs = Math.max(0, Math.round(config.streamLatencyOffsetMs || 0));
   lastRestartAt = new Date().toISOString();
 
@@ -1839,6 +1886,9 @@ function spawnMpvNow(config: RuntimeConfig) {
 
     activeProcess = null;
     mpvIpcPipePath = null;
+    mpvIpcHealthy = null;
+    mpvIpcLastCheckedAt = null;
+    mpvIpcLastError = null;
     appliedLatencyOffsetMs = 0;
     resetVideoTimestamp();
     if (desiredConfig?.stream && desiredConfig.clientSettings.playEnabled && !desiredConfig.serverPauseEnabled) {
