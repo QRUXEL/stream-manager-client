@@ -1735,12 +1735,6 @@ function probeMpvExecutable(command: string) {
 
   const name = basename(normalized).toLowerCase();
 
-  // For bare command names resolved via PATH, defer strict validation to spawn time.
-  // Some Windows mpv installs can fail sync probe despite being runnable for playback.
-  if (!hasPathSeparator && (name === "mpv" || name === "mpv.exe" || name === "mpv.com" || name === "mpvnet.exe")) {
-    return true;
-  }
-
   if (name === "mpv.exe") {
     const siblingCom = normalized.replace(/\.exe$/i, ".com");
     if (siblingCom !== normalized && existsSync(siblingCom)) {
@@ -1758,7 +1752,7 @@ function probeMpvExecutable(command: string) {
     }
   }
 
-  if ((name === "mpv.exe" || name === "mpvnet.exe") && (hasPathSeparator || existsAsPath)) {
+  if ((name === "mpv.exe" || name === "mpv.com" || name === "mpvnet.exe") && (hasPathSeparator || existsAsPath)) {
     appendLog(`Accepting mpv candidate despite probe failure: ${normalized}`);
     return true;
   }
@@ -1769,6 +1763,31 @@ function probeMpvExecutable(command: string) {
 function resolveMpvExecutablePath() {
   if (resolvedMpvExecutablePath && probeMpvExecutable(resolvedMpvExecutablePath)) {
     return resolvedMpvExecutablePath;
+  }
+
+  const preferredConfiguredCandidates = [
+    String(Bun.env.MPV_PATH || "").trim(),
+    String(mpvPath || "").trim(),
+  ].filter((item) => item.length > 0);
+
+  for (const candidate of preferredConfiguredCandidates) {
+    const isPathLike = candidate.includes("\\") || candidate.includes("/");
+    if (!isPathLike || !existsSync(candidate)) {
+      continue;
+    }
+
+    if (probeMpvExecutable(candidate)) {
+      resolvedMpvExecutablePath = candidate;
+      appendLog(`Resolved mpv executable from configured path: ${candidate}`);
+      return candidate;
+    }
+
+    const candidateName = basename(candidate).toLowerCase();
+    if (candidateName === "mpv.exe" || candidateName === "mpv.com" || candidateName === "mpvnet.exe") {
+      resolvedMpvExecutablePath = candidate;
+      appendLog(`Resolved mpv executable from configured path despite probe failure: ${candidate}`);
+      return candidate;
+    }
   }
 
   const findMpvInDirectory = (root: string, maxDepth = 4): string | null => {
