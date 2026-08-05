@@ -43,6 +43,10 @@ type GlobalFfplaySettings = {
   hls: HlsGlobalSettings;
 };
 
+type GlobalMpvSettings = {
+  extraArgs: ToggleValue<string>;
+};
+
 type ClientSettings = {
   playEnabled: boolean;
   screenIndex: number;
@@ -59,6 +63,7 @@ type ClientSettings = {
 type RuntimeConfig = {
   stream: StreamConfig | null;
   globalFfplaySettings: GlobalFfplaySettings;
+  globalMpvSettings: GlobalMpvSettings;
   clientSettings: ClientSettings;
   streamLatencyOffsetMs: number;
   serverPauseEnabled: boolean;
@@ -576,6 +581,16 @@ function splitArgs(input: string) {
   return result;
 }
 
+function hasMpvGeometryArg(args: string[]) {
+  for (const token of args) {
+    if (token === "--geometry" || token.startsWith("--geometry=")) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function quoteArg(arg: string) {
   if (/^[A-Za-z0-9_\-.:/\\]+$/.test(arg)) {
     return arg;
@@ -881,6 +896,7 @@ function normalizeRuntimeConfig(raw: unknown): RuntimeConfig | null {
   const value = raw as Partial<RuntimeConfig>;
   const streamRaw = value.stream as Partial<StreamConfig> | null | undefined;
   const globalRaw = (value.globalFfplaySettings ?? {}) as Partial<GlobalFfplaySettings>;
+  const globalMpvRaw = (value.globalMpvSettings ?? {}) as Partial<GlobalMpvSettings>;
   const clientRaw = (value.clientSettings ?? {}) as Partial<ClientSettings>;
 
   const stream: StreamConfig | null =
@@ -968,6 +984,10 @@ function normalizeRuntimeConfig(raw: unknown): RuntimeConfig | null {
     };
   }
   const hlsRaw = (globalRaw.hls && typeof globalRaw.hls === "object" ? globalRaw.hls : {}) as Partial<HlsGlobalSettings>;
+  const globalMpvExtraArgsRaw =
+    globalMpvRaw.extraArgs && typeof globalMpvRaw.extraArgs === "object"
+      ? globalMpvRaw.extraArgs
+      : {};
   const liveStartIndex = hlsRaw.liveStartIndex && typeof hlsRaw.liveStartIndex === "object" ? hlsRaw.liveStartIndex : {};
   const preferXStart = hlsRaw.preferXStart && typeof hlsRaw.preferXStart === "object" ? hlsRaw.preferXStart : {};
   const httpPersistent = hlsRaw.httpPersistent && typeof hlsRaw.httpPersistent === "object" ? hlsRaw.httpPersistent : {};
@@ -1011,6 +1031,12 @@ function normalizeRuntimeConfig(raw: unknown): RuntimeConfig | null {
           enabled: Boolean((allowedExtensions as any).enabled),
           value: String((allowedExtensions as any).value ?? ""),
         },
+      },
+    },
+    globalMpvSettings: {
+      extraArgs: {
+        enabled: Boolean((globalMpvExtraArgsRaw as any).enabled),
+        value: String((globalMpvExtraArgsRaw as any).value ?? "").trim(),
       },
     },
     clientSettings: {
@@ -1893,9 +1919,18 @@ function buildMpvArgs(config: RuntimeConfig) {
     args.push(`--volume=${volumePercent}`);
   }
 
-  const windowX = Number.isFinite(config.clientSettings.windowX) ? Math.floor(config.clientSettings.windowX) : 0;
-  const windowY = Number.isFinite(config.clientSettings.windowY) ? Math.floor(config.clientSettings.windowY) : 0;
-  args.push(`--geometry=${Math.max(0, windowX)}:${Math.max(0, windowY)}`);
+  const globalMpvArgs = config.globalMpvSettings.extraArgs.enabled
+    ? splitArgs(config.globalMpvSettings.extraArgs.value)
+    : [];
+  const streamExtraArgs = config.stream?.extraArgs ? splitArgs(config.stream.extraArgs) : [];
+  const clientExtraArgs = config.clientSettings.extraArgs ? splitArgs(config.clientSettings.extraArgs) : [];
+
+  const allExtraArgs = [...globalMpvArgs, ...streamExtraArgs, ...clientExtraArgs];
+  if (!hasMpvGeometryArg(allExtraArgs)) {
+    const windowX = Number.isFinite(config.clientSettings.windowX) ? Math.floor(config.clientSettings.windowX) : 0;
+    const windowY = Number.isFinite(config.clientSettings.windowY) ? Math.floor(config.clientSettings.windowY) : 0;
+    args.push(`--geometry=${Math.max(0, windowX)}:${Math.max(0, windowY)}`);
+  }
 
   if (config.clientSettings.fastDecode) {
     args.push("--vd-lavc-fast");
@@ -1905,13 +1940,7 @@ function buildMpvArgs(config: RuntimeConfig) {
     args.push("--profile=low-latency");
   }
 
-  if (config.stream?.extraArgs) {
-    args.push(...splitArgs(config.stream.extraArgs));
-  }
-
-  if (config.clientSettings.extraArgs) {
-    args.push(...splitArgs(config.clientSettings.extraArgs));
-  }
+  args.push(...globalMpvArgs, ...streamExtraArgs, ...clientExtraArgs);
 
   args.push(config.stream?.url ?? "");
   return args;
