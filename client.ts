@@ -1992,7 +1992,7 @@ function spawnMpvNow(config: RuntimeConfig) {
   appendLog(`Starting mpv: ${executable} ${args.join(" ")}`);
 
   const spawnCommand = shouldUseCmdWrapperForExecutable(executable)
-    ? ["cmd.exe", "/d", "/s", "/c", buildCommandLine(executable, args)]
+    ? ["cmd.exe", "/d", "/c", executable, ...args]
     : [executable, ...args];
 
   if (shouldUseCmdWrapperForExecutable(executable)) {
