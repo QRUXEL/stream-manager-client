@@ -688,6 +688,104 @@ function Ensure-MpvInstalled {
   Write-Host "Using mpv executable: $mpvSource"
 }
 
+function Add-PathEntryIfMissing {
+  param(
+    [string]$PathValue,
+    [ValidateSet('Process', 'User')]
+    [string]$Scope
+  )
+
+  if ([string]::IsNullOrWhiteSpace($PathValue)) {
+    return
+  }
+
+  $normalizedTarget = $PathValue.Trim().TrimEnd('\\')
+  if ([string]::IsNullOrWhiteSpace($normalizedTarget)) {
+    return
+  }
+
+  if ($Scope -eq 'Process') {
+    $current = [string]$env:Path
+    $entries = @($current -split ';' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $alreadyExists = $false
+    foreach ($entry in $entries) {
+      if ($entry.TrimEnd('\\') -ieq $normalizedTarget) {
+        $alreadyExists = $true
+        break
+      }
+    }
+
+    if (-not $alreadyExists) {
+      if ([string]::IsNullOrWhiteSpace($current)) {
+        $env:Path = $normalizedTarget
+      } else {
+        $env:Path = "$normalizedTarget;$current"
+      }
+    }
+    return
+  }
+
+  $currentUserPath = [string][System.Environment]::GetEnvironmentVariable('Path', 'User')
+  $userEntries = @($currentUserPath -split ';' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+  foreach ($entry in $userEntries) {
+    if ($entry.TrimEnd('\\') -ieq $normalizedTarget) {
+      return
+    }
+  }
+
+  $updated = if ([string]::IsNullOrWhiteSpace($currentUserPath)) {
+    $normalizedTarget
+  } else {
+    "$normalizedTarget;$currentUserPath"
+  }
+
+  try {
+    [System.Environment]::SetEnvironmentVariable('Path', $updated, 'User')
+  }
+  catch {
+    Write-Host 'Warning: unable to persist mpv directory to user PATH; current process PATH was still updated.'
+  }
+}
+
+function Ensure-MpvRuntimeEnvironment {
+  $configured = [string]$env:MPV_PATH
+  $resolved = $null
+
+  if (-not [string]::IsNullOrWhiteSpace($configured) -and (Test-Path -Path $configured)) {
+    try {
+      & $configured --version *> $null
+      if ($LASTEXITCODE -eq 0) {
+        $resolved = $configured
+      }
+    }
+    catch {
+      $resolved = $null
+    }
+  }
+
+  if (-not $resolved) {
+    $resolved = Get-RunnableMpvExecutable
+  }
+
+  if (-not $resolved) {
+    Write-Host 'Warning: mpv runtime path is unavailable. Client may fall back to ffplay until mpv is discoverable.'
+    return
+  }
+
+  $env:MPV_PATH = $resolved
+  try {
+    [System.Environment]::SetEnvironmentVariable('MPV_PATH', $resolved, 'User')
+  }
+  catch {
+    Write-Host 'Warning: unable to persist MPV_PATH to user environment; using process-level MPV_PATH only.'
+  }
+
+  $mpvDir = Split-Path -Path $resolved -Parent
+  Add-PathEntryIfMissing -PathValue $mpvDir -Scope Process
+  Add-PathEntryIfMissing -PathValue $mpvDir -Scope User
+  Write-Host "Using mpv runtime path: $resolved"
+}
+
 function Update-ClientFromGitHub {
   $repoRoot = (& git rev-parse --show-toplevel 2>$null)
   if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) {
@@ -769,6 +867,7 @@ Update-ClientFromGitHub
 Ensure-FfplayInstalled
 Ensure-GstreamerInstalled
 Ensure-MpvInstalled
+Ensure-MpvRuntimeEnvironment
 
 if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
   Write-Host 'Installing Bun...'
@@ -791,6 +890,7 @@ bun --version
 bun install
 
 while ($true) {
+  Ensure-MpvRuntimeEnvironment
   Write-Host 'Starting client runtime...'
   bun run client
   $exitCode = $LASTEXITCODE

@@ -1734,6 +1734,13 @@ function probeMpvExecutable(command: string) {
   }
 
   const name = basename(normalized).toLowerCase();
+
+  // For bare command names resolved via PATH, defer strict validation to spawn time.
+  // Some Windows mpv installs can fail sync probe despite being runnable for playback.
+  if (!hasPathSeparator && (name === "mpv" || name === "mpv.exe" || name === "mpv.com" || name === "mpvnet.exe")) {
+    return true;
+  }
+
   if (name === "mpv.exe") {
     const siblingCom = normalized.replace(/\.exe$/i, ".com");
     if (siblingCom !== normalized && existsSync(siblingCom)) {
