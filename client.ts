@@ -602,6 +602,16 @@ function buildCommandLine(executable: string, args: string[]) {
   return [quoteArg(executable), ...args.map((arg) => quoteArg(arg))].join(" ");
 }
 
+function shouldUseCmdWrapperForExecutable(executable: string) {
+  const normalized = String(executable || "").trim();
+  if (!normalized) {
+    return false;
+  }
+
+  const hasPathSeparator = normalized.includes("\\") || normalized.includes("/");
+  return hasPathSeparator && /\.com$/i.test(normalized);
+}
+
 function isPidRunning(pid: number) {
   if (!Number.isFinite(pid) || pid <= 0) {
     return false;
@@ -1981,7 +1991,15 @@ function spawnMpvNow(config: RuntimeConfig) {
   currentCommandLine = buildCommandLine(executable, args);
   appendLog(`Starting mpv: ${executable} ${args.join(" ")}`);
 
-  const processRef = Bun.spawn([executable, ...args], {
+  const spawnCommand = shouldUseCmdWrapperForExecutable(executable)
+    ? ["cmd.exe", "/d", "/s", "/c", buildCommandLine(executable, args)]
+    : [executable, ...args];
+
+  if (shouldUseCmdWrapperForExecutable(executable)) {
+    appendLog(`Launching mpv via cmd.exe wrapper for .com executable compatibility: ${executable}`);
+  }
+
+  const processRef = Bun.spawn(spawnCommand, {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
