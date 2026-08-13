@@ -1272,6 +1272,33 @@ async function pipeStreamToLogs(
   }
 }
 
+function killProcessTree(processRef: ReturnType<typeof Bun.spawn>) {
+  const pid = processRef.pid;
+
+  // On Windows, killing a cmd.exe wrapper (used for .com executable compatibility)
+  // only terminates cmd.exe, leaving the real child process (e.g. mpv) orphaned.
+  // taskkill /T walks the whole process tree so wrapped children die too.
+  if (process.platform === "win32" && Number.isFinite(pid) && pid > 0) {
+    try {
+      const result = Bun.spawnSync(["taskkill", "/PID", String(pid), "/T", "/F"], {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      if (result.exitCode === 0) {
+        return;
+      }
+    } catch {
+    }
+  }
+
+  try {
+    processRef.kill();
+  } catch (error) {
+    appendLog(`Error while stopping process tree: ${String(error)}`);
+  }
+}
+
 function killFfplay() {
   clearDelayedStartTimer();
 
@@ -1281,12 +1308,8 @@ function killFfplay() {
     return;
   }
 
-  appendLog("Stopping ffplay process");
-  try {
-    activeProcess.kill();
-  } catch (error) {
-    appendLog(`Error while stopping ffplay: ${String(error)}`);
-  }
+  appendLog("Stopping active player process");
+  killProcessTree(activeProcess);
   activeProcess = null;
   currentCommandLine = null;
   appliedLatencyOffsetMs = 0;
