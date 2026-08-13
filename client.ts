@@ -679,12 +679,8 @@ function stopOverlayApp() {
     return;
   }
 
-  try {
-    overlayExpectedExit = true;
-    overlayProcess.kill();
-  } catch (error) {
-    appendOverlayLog(`Error while stopping overlay app: ${String(error)}`);
-  }
+  overlayExpectedExit = true;
+  killProcessTree(overlayProcess);
 
   overlayProcess = null;
   overlayServerBaseUrl = null;
